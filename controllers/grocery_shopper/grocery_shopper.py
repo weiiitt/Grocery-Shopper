@@ -5,6 +5,7 @@
 from controller import Robot
 import math
 import numpy as np
+from image_tools import ImageTools
 
 #Initialization
 print("=== Initializing Grocery Shopper...")
@@ -21,6 +22,8 @@ LIDAR_ANGLE_RANGE = math.radians(240)
 
 # create the Robot instance.
 robot = Robot()
+
+image_tools = ImageTools()
 
 # get the time step of the current world.
 timestep = int(robot.getBasicTimeStep())
@@ -49,10 +52,14 @@ right_gripper_enc=robot.getDevice("gripper_right_finger_joint_sensor")
 left_gripper_enc.enable(timestep)
 right_gripper_enc.enable(timestep)
 
-# Enable Camera
-camera = robot.getDevice('camera')
-camera.enable(timestep)
-camera.recognitionEnable(timestep)
+# Enable Camera (changed the camera to range finder)
+# camera = robot.getDevice('camera')
+# camera.enable(timestep)
+# camera.recognitionEnable(timestep)
+
+# Enable Range Finder
+range_finder = robot.getDevice('depth_camera')
+range_finder.enable(timestep)
 
 # Enable GPS and compass localization
 gps = robot.getDevice("gps")
@@ -82,17 +89,40 @@ lidar_offsets = lidar_offsets[83:len(lidar_offsets)-83] # Only keep lidar readin
 
 map = None
 
-
+# Enable keyboard
+keyboard = robot.getKeyboard()
+keyboard.enable(timestep)
 
 # ------------------------------------------------------------------
 # Helper Functions
 
+def save_depth_image():
+    """Save the current depth camera image and raw depth data."""
+    # Get the depth image data
+    depth_data = range_finder.getRangeImage()
+    if depth_data:
+        # Convert depth data to image format
+        width = range_finder.getWidth()
+        height = range_finder.getHeight()
+        
+        # Save raw depth data as numpy array
+        depth_array = np.array(depth_data).reshape(height, width)
+        
+        image_tools.save_depth_image(depth_array, '../../camera_data')
 
 gripper_status="closed"
 
 # Main Loop
 while robot.step(timestep) != -1:
+    # Get keyboard input
+    key = keyboard.getKey()
+    while keyboard.getKey() != -1:
+        pass
     
+    # Handle keyboard input
+    if key == ord('C'):
+        print("Saving depth image...")
+        save_depth_image()
     
     robot_parts["wheel_left_joint"].setVelocity(vL)
     robot_parts["wheel_right_joint"].setVelocity(vR)
@@ -109,3 +139,5 @@ while robot.step(timestep) != -1:
         robot_parts["gripper_right_finger_joint"].setPosition(0.045)
         if left_gripper_enc.getValue()>=0.044:
             gripper_status="open"
+
+    

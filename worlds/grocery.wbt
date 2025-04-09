@@ -1176,13 +1176,13 @@ TiagoSteel {
   rotation 0.48134709376506196 0.8763253227003475 -0.018944764924922582 0.0219016264587718
   controller "grocery_shopper"
   cameraSlot [
-    Camera {
+    RangeFinder {
+      name "depth_camera"
       rotation 1 0 0 -1.5707953071795862
       fieldOfView 2
       width 240
       height 135
-      recognition Recognition {
-      }
+      maxRange 5.0
     }
     Display {
       width 360
