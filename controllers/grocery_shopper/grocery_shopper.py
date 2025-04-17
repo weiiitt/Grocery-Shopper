@@ -39,6 +39,11 @@ part_names = ("head_2_joint", "head_1_joint", "torso_lift_joint", "arm_1_joint",
 # All motors except the wheels are controlled by position control. The wheels
 # are controlled by a velocity controller. We therefore set their position to infinite.
 target_pos = (0.0, 0.0, 0.35, 0.07, 1.02, -3.16, 1.27, 1.32, 0.0, 1.41, 'inf', 'inf',0.045,0.045)
+# Initialize head tilt angle from target_pos
+current_head_tilt = target_pos[1] # head_2_joint is the second element
+HEAD_TILT_STEP = 0.05
+HEAD_TILT_MAX = 0.5
+HEAD_TILT_MIN = -1.2
 
 robot_parts={}
 for i, part_name in enumerate(part_names):
@@ -60,6 +65,11 @@ right_gripper_enc.enable(timestep)
 # Enable Range Finder
 range_finder = robot.getDevice('depth_camera')
 range_finder.enable(timestep)
+
+# Enable RGB Camera
+rgb_camera = robot.getDevice('rgb_camera')
+rgb_camera.enable(timestep)
+# rgb_camera.recognitionEnable(timestep)
 
 # Enable GPS and compass localization
 gps = robot.getDevice("gps")
@@ -95,20 +105,28 @@ keyboard.enable(timestep)
 
 # ------------------------------------------------------------------
 # Helper Functions
-
-def save_depth_image():
-    """Save the current depth camera image and raw depth data."""
-    # Get the depth image data
-    depth_data = range_finder.getRangeImage()
-    if depth_data:
-        # Convert depth data to image format
-        width = range_finder.getWidth()
-        height = range_finder.getHeight()
-        
-        # Save raw depth data as numpy array
-        depth_array = np.array(depth_data).reshape(height, width)
-        
-        image_tools.save_depth_image(depth_array, '../../camera_data')
+def handle_capture():
+    # Get the raw image data as bytes
+    color_image_data = rgb_camera.getImage()
+    depth_image = range_finder.getRangeImage()
+    
+    # Get camera dimensions
+    color_width = rgb_camera.getWidth()
+    color_height = rgb_camera.getHeight()
+    
+    # Convert bytes to numpy array (correct shape)
+    color_image = np.frombuffer(color_image_data, np.uint8)
+    # Reshape considering BGRA format (4 channels) that Webots uses
+    color_image = color_image.reshape(color_height, color_width, 4)
+    # Convert to RGB if needed
+    color_image = color_image[:, :, :3]
+    
+    # Handle depth image
+    depth_width = range_finder.getWidth()
+    depth_height = range_finder.getHeight()
+    depth_image = np.array(depth_image).reshape(depth_height, depth_width)
+    
+    image_tools.save_images(color_image, depth_image, '../../camera_data')
 
 gripper_status="closed"
 
@@ -121,8 +139,13 @@ while robot.step(timestep) != -1:
     
     # Handle keyboard input
     if key == ord('C'):
-        print("Saving depth image...")
-        save_depth_image()
+        handle_capture()
+    elif key == keyboard.UP:
+        current_head_tilt = min(HEAD_TILT_MAX, current_head_tilt + HEAD_TILT_STEP)
+        robot_parts["head_2_joint"].setPosition(current_head_tilt)
+    elif key == keyboard.DOWN:
+        current_head_tilt = max(HEAD_TILT_MIN, current_head_tilt - HEAD_TILT_STEP)
+        robot_parts["head_2_joint"].setPosition(current_head_tilt)
     
     robot_parts["wheel_left_joint"].setVelocity(vL)
     robot_parts["wheel_right_joint"].setVelocity(vR)
