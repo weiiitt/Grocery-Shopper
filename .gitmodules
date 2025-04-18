@@ -1,0 +1,3 @@
+[submodule "FusionVision"]
+	path = FusionVision
+	url = https://github.com/safouaneelg/FusionVision.git

@@ -6,6 +6,7 @@ from controller import Robot
 import math
 import numpy as np
 from image_tools import ImageTools
+import open3d as o3d
 
 #Initialization
 print("=== Initializing Grocery Shopper...")
@@ -23,7 +24,10 @@ LIDAR_ANGLE_RANGE = math.radians(240)
 # create the Robot instance.
 robot = Robot()
 
-image_tools = ImageTools()
+image_tools = ImageTools(
+    yolo_weight_path='./models/best.pt',
+    fastsam_weight_path='./models/FastSAM-s.pt',
+)
 
 # get the time step of the current world.
 timestep = int(robot.getBasicTimeStep())
@@ -39,11 +43,15 @@ part_names = ("head_2_joint", "head_1_joint", "torso_lift_joint", "arm_1_joint",
 # All motors except the wheels are controlled by position control. The wheels
 # are controlled by a velocity controller. We therefore set their position to infinite.
 target_pos = (0.0, 0.0, 0.35, 0.07, 1.02, -3.16, 1.27, 1.32, 0.0, 1.41, 'inf', 'inf',0.045,0.045)
-# Initialize head tilt angle from target_pos
+# Initialize head angles from target_pos
+current_head_yaw = target_pos[0]  # head_1_joint is the first element
 current_head_tilt = target_pos[1] # head_2_joint is the second element
 HEAD_TILT_STEP = 0.05
 HEAD_TILT_MAX = 0.5
 HEAD_TILT_MIN = -1.2
+HEAD_YAW_STEP = 0.05 # Step size for head yaw
+HEAD_YAW_MAX = 1.0   # Maximum head yaw angle
+HEAD_YAW_MIN = -1.0  # Minimum head yaw angle
 
 robot_parts={}
 for i, part_name in enumerate(part_names):
@@ -56,11 +64,6 @@ left_gripper_enc=robot.getDevice("gripper_left_finger_joint_sensor")
 right_gripper_enc=robot.getDevice("gripper_right_finger_joint_sensor")
 left_gripper_enc.enable(timestep)
 right_gripper_enc.enable(timestep)
-
-# Enable Camera (changed the camera to range finder)
-# camera = robot.getDevice('camera')
-# camera.enable(timestep)
-# camera.recognitionEnable(timestep)
 
 # Enable Range Finder
 range_finder = robot.getDevice('depth_camera')
@@ -84,6 +87,8 @@ lidar.enablePointCloud()
 
 # Enable display
 display = robot.getDevice("display")
+SAM_view_display = robot.getDevice("SAM view")
+
 
 # Odometry
 pose_x     = 0
@@ -99,6 +104,21 @@ lidar_offsets = lidar_offsets[83:len(lidar_offsets)-83] # Only keep lidar readin
 
 map = None
 
+# Camera Intrinsics
+width = 640
+height = 480
+fov_x_rad = 1.49
+
+# Calculate principal point
+cx = width / 2
+cy = height / 2
+
+# Calculate focal length
+fx = (width / 2) / np.tan(fov_x_rad / 2)
+fy = fx # Assuming square pixels
+
+o3d_intrinsics = o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
+
 # Enable keyboard
 keyboard = robot.getKeyboard()
 keyboard.enable(timestep)
@@ -109,58 +129,101 @@ def handle_capture():
     # Get the raw image data as bytes
     color_image_data = rgb_camera.getImage()
     depth_image = range_finder.getRangeImage()
-    
-    # Get camera dimensions
-    color_width = rgb_camera.getWidth()
-    color_height = rgb_camera.getHeight()
+
     
     # Convert bytes to numpy array (correct shape)
     color_image = np.frombuffer(color_image_data, np.uint8)
     # Reshape considering BGRA format (4 channels) that Webots uses
-    color_image = color_image.reshape(color_height, color_width, 4)
+    color_image = color_image.reshape(height, width, 4)
     # Convert to RGB if needed
     color_image = color_image[:, :, :3]
     
     # Handle depth image
-    depth_width = range_finder.getWidth()
-    depth_height = range_finder.getHeight()
-    depth_image = np.array(depth_image).reshape(depth_height, depth_width)
+    # depth_width = range_finder.getWidth()
+    # depth_height = range_finder.getHeight()
+    # depth_image = np.array(depth_image).reshape(depth_height, depth_width)
     
-    image_tools.save_images(color_image, depth_image, '../../camera_data')
+    image_tools.save_sequential_color_image(color_image, '../../training_data')
+
+def draw_detected_objects():
+    color_image = rgb_camera.getImage()
+    depth_image = range_finder.getRangeImage()
+    
+    color_image = np.frombuffer(color_image, np.uint8)
+    color_image = color_image.reshape(height, width, 4)
+    color_image = color_image[:, :, :3]
+    
+    depth_image = np.array(depth_image).reshape(height, width)
+
+    result_image, object_masks, object_point_clouds, detections = image_tools.process_and_extract_objects(color_image, depth_image, o3d_intrinsics, result_image=False)
+    SAM_view_display.setColor(0xFFFFFF)
+    if object_masks.any():
+        for x in range(height):
+            for y in range(width):
+                if object_masks[x, y]:
+                    SAM_view_display.drawPixel(y, x)
+    
 
 gripper_status="closed"
 
 # Main Loop
 while robot.step(timestep) != -1:
-    # Get keyboard input
-    key = keyboard.getKey()
-    while keyboard.getKey() != -1:
-        pass
-    
-    # Handle keyboard input
-    if key == ord('C'):
+    SAM_view_display.setColor(0x000000)
+    SAM_view_display.fillRectangle(0, 0, 640, 480)
+    draw_detected_objects()
+    # Reset velocities at the start of each loop
+    vL = 0
+    vR = 0
+
+    # Get keyboard input for this timestep
+    key = keyboard.getKey() 
+    # Removed the problematic inner while loop that consumed subsequent key presses
+
+    # Handle keyboard input for movement
+    if key == ord('W'):  # Forward
+        vL = MAX_SPEED
+        vR = MAX_SPEED
+    elif key == ord('S'):  # Backward
+        vL = -MAX_SPEED
+        vR = -MAX_SPEED
+    elif key == ord('A'):  # Turn Left
+        vL = -MAX_SPEED / 2
+        vR = MAX_SPEED / 2
+    elif key == ord('D'):  # Turn Right
+        vL = MAX_SPEED / 2
+        vR = -MAX_SPEED / 2
+    # Handle other keyboard input
+    elif key == ord('C'):
         handle_capture()
-    elif key == keyboard.UP:
+    elif key == keyboard.UP: # Head tilt up
         current_head_tilt = min(HEAD_TILT_MAX, current_head_tilt + HEAD_TILT_STEP)
         robot_parts["head_2_joint"].setPosition(current_head_tilt)
-    elif key == keyboard.DOWN:
+    elif key == keyboard.DOWN: # Head tilt down
         current_head_tilt = max(HEAD_TILT_MIN, current_head_tilt - HEAD_TILT_STEP)
         robot_parts["head_2_joint"].setPosition(current_head_tilt)
+    elif key == keyboard.LEFT: # Head yaw left
+        current_head_yaw = min(HEAD_YAW_MAX, current_head_yaw + HEAD_YAW_STEP)
+        robot_parts["head_1_joint"].setPosition(current_head_yaw)
+    elif key == keyboard.RIGHT: # Head yaw right
+        current_head_yaw = max(HEAD_YAW_MIN, current_head_yaw - HEAD_YAW_STEP)
+        robot_parts["head_1_joint"].setPosition(current_head_yaw)
     
+    # Set wheel velocities based on the key pressed in this timestep
     robot_parts["wheel_left_joint"].setVelocity(vL)
     robot_parts["wheel_right_joint"].setVelocity(vR)
     
-    if(gripper_status=="open"):
-        # Close gripper, note that this takes multiple time steps...
-        robot_parts["gripper_left_finger_joint"].setPosition(0)
-        robot_parts["gripper_right_finger_joint"].setPosition(0)
-        if right_gripper_enc.getValue()<=0.005:
-            gripper_status="closed"
-    else:
-        # Open gripper
-        robot_parts["gripper_left_finger_joint"].setPosition(0.045)
-        robot_parts["gripper_right_finger_joint"].setPosition(0.045)
-        if left_gripper_enc.getValue()>=0.044:
-            gripper_status="open"
+    # Gripper control remains the same
+    # if(gripper_status=="open"):
+    #     # Close gripper, note that this takes multiple time steps...
+    #     robot_parts["gripper_left_finger_joint"].setPosition(0)
+    #     robot_parts["gripper_right_finger_joint"].setPosition(0)
+    #     if right_gripper_enc.getValue()<=0.005:
+    #         gripper_status="closed"
+    # else:
+    #     # Open gripper
+    #     robot_parts["gripper_left_finger_joint"].setPosition(0.045)
+    #     robot_parts["gripper_right_finger_joint"].setPosition(0.045)
+    #     if left_gripper_enc.getValue()>=0.044:
+    #         gripper_status="open"
 
     
