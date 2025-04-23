@@ -7,6 +7,9 @@ import trimesh
 import open3d as o3d
 from ultralytics import YOLO
 import torch
+from graspnetAPI import GraspGroup
+from typing import Tuple, List, Dict, Any, Optional
+
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "FusionVision"))
 from FastSAM.fastsam import FastSAM, FastSAMPrompt
@@ -21,12 +24,33 @@ from utils import perform_yolo_inference
 class ImageTools:
     def __init__(
         self,
-        yolo_weight_path,
-        fastsam_weight_path,
-        yolo_conf_threshold=0.9,
-        fastsam_conf=0.3,
-        fastsam_iou=0.7,
+        yolo_weight_path: str,
+        fastsam_weight_path: str,
+        graspnet_root: str,
+        graspnet_checkpoint_path: str,
+        yolo_conf_threshold: float = 0.9,
+        fastsam_conf: float = 0.3,
+        fastsam_iou: float = 0.7,
+        num_point: int = 20000,
+        num_view: int = 300,
+        collision_thresh: float = 0.01,
+        voxel_size: float = 0.01,
     ):
+        """Initializes the ImageTools class, loading necessary models and setting up paths.
+
+        Args:
+            yolo_weight_path (str): Path to the YOLO model weights file.
+            fastsam_weight_path (str): Path to the FastSAM model weights file.
+            graspnet_root (str): Root directory of the GraspNet baseline.
+            graspnet_checkpoint_path (str): Path to the GraspNet checkpoint file.
+            yolo_conf_threshold (float, optional): Confidence threshold for YOLO detections. Defaults to 0.9.
+            fastsam_conf (float, optional): Confidence threshold for FastSAM segmentation. Defaults to 0.3.
+            fastsam_iou (float, optional): IoU threshold for FastSAM segmentation. Defaults to 0.7.
+            num_point (int, optional): Number of points to sample for GraspNet. Defaults to 20000.
+            num_view (int, optional): Number of views for GraspNet. Defaults to 300.
+            collision_thresh (float, optional): Collision threshold distance for GraspNet. Defaults to 0.01.
+            voxel_size (float, optional): Voxel size for collision detection downsampling. Defaults to 0.01.
+        """
         # Initialize models here
         print(f"Loading YOLO model from: {yolo_weight_path}")
         self.yolo_model = YOLO(yolo_weight_path)
@@ -37,9 +61,69 @@ class ImageTools:
         self.fastsam_iou = fastsam_iou
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
         print("Models loaded.")
+        
+        print("loading graspnet")
+        self.graspnet_root = graspnet_root
+        self._setup_paths()
+        self._import_graspnet_modules()
+        self.checkpoint_path = graspnet_checkpoint_path
+        self.num_point = num_point
+        self.num_view = num_view
+        self.collision_thresh = collision_thresh
+        self.voxel_size = voxel_size
+        self.net = self._init_network()
 
-    def get_object_pose(self, depth_data, obj_file):
-        """Get the pose of an object in the depth image."""
+    def _setup_paths(self):
+        """Setup necessary paths for graspnet-baseline"""
+        paths = [
+            'models',
+            'dataset',
+            'utils',
+            ''  # for the base directory
+        ]
+        
+        for path in paths:
+            full_path = os.path.join(self.graspnet_root, path)
+            if not os.path.exists(full_path):
+                raise ValueError(f"Required path does not exist: {full_path}")
+            if full_path not in sys.path:
+                sys.path.append(full_path)
+
+    def _import_graspnet_modules(self):
+        """Import GraspNet modules after paths are set up"""
+        global GraspNet, pred_decode, GraspNetDataset, ModelFreeCollisionDetector
+        global CameraInfo, create_point_cloud_from_depth_image
+        
+        from graspnet import GraspNet, pred_decode
+        from graspnet_dataset import GraspNetDataset
+        from collision_detector import ModelFreeCollisionDetector
+        from data_utils import CameraInfo, create_point_cloud_from_depth_image
+    
+    def _init_network(self):
+        # Init the model
+        net = GraspNet(input_feature_dim=0, num_view=self.num_view, num_angle=12, num_depth=4,
+                cylinder_radius=0.05, hmin=-0.02, hmax_list=[0.01,0.02,0.03,0.04], is_training=False)
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        net.to(device)
+        # Load checkpoint
+        checkpoint = torch.load(self.checkpoint_path)
+        net.load_state_dict(checkpoint['model_state_dict'])
+        start_epoch = checkpoint['epoch']
+        print(f"-> loaded checkpoint {self.checkpoint_path} (epoch: {start_epoch})")
+        # set model to eval mode
+        net.eval()
+        return net
+
+    def get_object_pose(self, depth_data: np.ndarray, obj_file: str) -> None:
+        """Get the pose of an object in the depth image (Not fully implemented).
+
+        Args:
+            depth_data (np.ndarray): The depth image data.
+            obj_file (str): Path to the object's mesh file (e.g., .obj).
+
+        Returns:
+            None: Currently does not return anything.
+        """
         # Load the object mesh
         # mesh = trimesh.load(obj_file)
 
@@ -52,8 +136,13 @@ class ImageTools:
 
         pass
 
-    def save_depth_image(self, depth_data, directory):
-        """Save the depth data as a PNG image."""
+    def save_depth_image(self, depth_data: np.ndarray, directory: str) -> None:
+        """Saves the raw depth data as .npy and a visualization as .png.
+
+        Args:
+            depth_data (np.ndarray): The depth image data.
+            directory (str): The directory to save the files in.
+        """
         np.save(directory + "/depth_data.npy", depth_data)
         print("Raw depth data saved as 'depth_data.npy'")
 
@@ -89,8 +178,13 @@ class ImageTools:
         plt.close()
         print("Depth visualization saved as 'depth_visualization.png'")
 
-    def save_color_image(self, color_data, directory):
-        """Save the color data as a PNG image."""
+    def save_color_image(self, color_data: np.ndarray, directory: str) -> None:
+        """Saves the raw color data (BGR) as .npy and a visualization (RGB) as .png.
+
+        Args:
+            color_data (np.ndarray): The BGR color image data.
+            directory (str): The directory to save the files in.
+        """
         np.save(directory + "/color_data.npy", color_data)
         print("Raw color data saved as 'color_data.npy'")
 
@@ -105,17 +199,23 @@ class ImageTools:
         plt.close()
         print("Color visualization saved as 'color_visualization.png'")
 
-    def save_images(self, color_image, depth_image, directory):
-        """Save the color and depth images as PNG files."""
+    def save_images(self, color_image: np.ndarray, depth_image: np.ndarray, directory: str) -> None:
+        """Saves both color and depth images using their respective save functions.
+
+        Args:
+            color_image (np.ndarray): The BGR color image data.
+            depth_image (np.ndarray): The depth image data.
+            directory (str): The directory to save the files in.
+        """
         # Save color image
         self.save_color_image(color_image, directory)
         self.save_depth_image(depth_image, directory)
 
-    def save_sequential_color_image(self, color_image, directory):
+    def save_sequential_color_image(self, color_image: np.ndarray, directory: str) -> None:
         """
-        Saves the color image to the specified directory with a sequential filename.
+        Saves the color image to the specified directory with a sequential filename (color_image_XXX.png).
 
-        Parameters:
+        Args:
             color_image (np.ndarray): The color image data (expected in BGR format).
             directory (str): The directory where the image should be saved.
         """
@@ -152,25 +252,32 @@ class ImageTools:
         except Exception as e:
             print(f"Error saving sequential color image: {e}")
 
-    def process_and_extract_objects(self, color_image, depth_image, intrinsics: o3d.camera.PinholeCameraIntrinsic, depth_scale=1.0, result_image: bool = True):
+    def process_and_extract_objects(
+        self,
+        color_image: np.ndarray,
+        depth_image: np.ndarray,
+        intrinsics: o3d.camera.PinholeCameraIntrinsic,
+        depth_scale: float = 1.0,
+        result_image: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray, o3d.geometry.PointCloud, List[Dict[str, Any]]]:
         """
-        Processes color and depth images to detect objects, selects the most confident
-        (or largest) one, segments it, and extracts its mask and point cloud.
+        Processes color/depth images: detects objects (YOLO), selects the best one,
+        segments it (FastSAM), and extracts its mask and point cloud.
 
         Args:
             color_image (np.ndarray): The BGR color image.
             depth_image (np.ndarray): The depth image (raw values).
             intrinsics (o3d.camera.PinholeCameraIntrinsic): Open3D camera intrinsic parameters.
-            depth_scale (float): The factor to convert depth values to meters (depth / depth_scale).
-            result_image (bool, optional): If True (default), generates and returns the overlay image.
-                                           If False, returns an empty array for the overlay image.
+            depth_scale (float, optional): Factor to convert depth values to meters. Defaults to 1.0.
+            result_image (bool, optional): If True, generate and return the overlay image.
+                                           If False, return an empty array for overlay. Defaults to True.
 
         Returns:
-            tuple: A tuple containing:
-                - overlay_image (np.ndarray): Color image with the selected object's YOLO box and FastSAM mask, or an empty array if result_image is False.
-                - object_masks (np.ndarray): Binary mask for the selected object (or empty array if no object).
-                - object_point_clouds (o3d.geometry.PointCloud): Point cloud for the selected object.
-                - detections (List[dict]): List of detection dictionaries for the selected object.
+            Tuple[np.ndarray, np.ndarray, o3d.geometry.PointCloud, List[Dict[str, Any]]]: A tuple containing:
+                - overlay_image (np.ndarray): Color image with YOLO box and FastSAM mask overlay (or empty array).
+                - object_masks (np.ndarray): Boolean mask for the selected object.
+                - object_point_clouds (o3d.geometry.PointCloud): Point cloud of the selected object.
+                - selected_detection_list (List[Dict[str, Any]]): List containing the dictionary of the selected detection.
         """
         # --- 1. YOLO Detection ---
         all_detections, _ = perform_yolo_inference(color_image, self.yolo_model, confidence_threshold=self.yolo_conf_threshold)
@@ -315,3 +422,165 @@ class ImageTools:
 
 
         return overlay_image, object_masks, object_point_clouds, selected_detection_list
+    def process_data(
+        self,
+        color: np.ndarray,
+        depth: np.ndarray,
+        workspace_mask: np.ndarray,
+        intrinsics: o3d.camera.PinholeCameraIntrinsic,
+        depth_scale: float = 1.0,
+    ) -> Tuple[Dict[str, torch.Tensor], o3d.geometry.PointCloud]:
+        """Generates a point cloud, applies workspace mask, samples points, and prepares data for GraspNet.
+
+        Args:
+            color (np.ndarray): The BGR color image.
+            depth (np.ndarray): The depth image (raw values).
+            workspace_mask (np.ndarray): A boolean mask defining the valid workspace area.
+            intrinsics (o3d.camera.PinholeCameraIntrinsic): Open3D camera intrinsic parameters.
+            depth_scale (float, optional): Factor to convert depth values to meters. Defaults to 1.0.
+
+        Returns:
+            Tuple[Dict[str, torch.Tensor], o3d.geometry.PointCloud]: A tuple containing:
+                - end_points (Dict[str, torch.Tensor]): Dictionary containing 'point_clouds' and 'cloud_colors' tensors for GraspNet.
+                - cloud_o3d (o3d.geometry.PointCloud): The generated Open3D point cloud (masked, but not sampled).
+        """
+        # Extract intrinsic parameters
+        fx = intrinsics.intrinsic_matrix[0, 0]
+        fy = intrinsics.intrinsic_matrix[1, 1]
+        cx = intrinsics.intrinsic_matrix[0, 2]
+        cy = intrinsics.intrinsic_matrix[1, 2]
+
+        # Generate point cloud
+        camera = CameraInfo(
+            width=depth.shape[1],
+            height=depth.shape[0],
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            scale=depth_scale
+        )
+        cloud = create_point_cloud_from_depth_image(depth, camera, organized=True)
+
+        # Get valid points
+        mask = workspace_mask & (depth > 0)
+        cloud_masked = cloud[mask]
+        color_masked = color[mask]
+
+        # Sample points
+        if len(cloud_masked) >= self.num_point:
+            idxs = np.random.choice(len(cloud_masked), self.num_point, replace=False)
+        else:
+            idxs1 = np.arange(len(cloud_masked))
+            idxs2 = np.random.choice(len(cloud_masked), self.num_point - len(cloud_masked), replace=True)
+            idxs = np.concatenate([idxs1, idxs2], axis=0)
+        cloud_sampled = cloud_masked[idxs]
+        color_sampled = color_masked[idxs]
+
+        # Convert data to Open3D format
+        cloud_o3d = o3d.geometry.PointCloud()
+        cloud_o3d.points = o3d.utility.Vector3dVector(cloud_masked.astype(np.float32))
+        # Assign the colors corresponding to the masked points. 
+        # Make sure colors are in the range [0, 1] and are float32.
+        # OpenCV loads images as BGR, so we need to convert to RGB for Open3D.
+        if color_masked.dtype == np.uint8:
+            normalized_colors = color_masked.astype(np.float32) / 255.0
+        else:
+            # Assume colors are already float, potentially in [0,1]
+            normalized_colors = color_masked.astype(np.float32) 
+            # Clamp values just in case they are outside [0, 1]
+            normalized_colors = np.clip(normalized_colors, 0.0, 1.0)
+            
+        # Convert BGR to RGB
+        rgb_colors = normalized_colors[:, ::-1] 
+        cloud_o3d.colors = o3d.utility.Vector3dVector(rgb_colors)
+
+        # Prepare data for neural network
+        end_points = dict()
+        cloud_sampled = torch.from_numpy(cloud_sampled[np.newaxis].astype(np.float32))
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        cloud_sampled = cloud_sampled.to(device)
+        end_points['point_clouds'] = cloud_sampled
+        end_points['cloud_colors'] = torch.from_numpy(color_sampled.astype(np.float32)).to(device)
+
+        return end_points, cloud_o3d
+    
+    def predict_grasps(self, end_points: Dict[str, torch.Tensor]) -> GraspGroup:
+        """Runs the GraspNet model to predict grasps based on the processed point cloud data.
+
+        Args:
+            end_points (Dict[str, torch.Tensor]): Dictionary containing 'point_clouds' and 'cloud_colors' tensors.
+
+        Returns:
+            GraspGroup: A GraspGroup object containing the predicted grasps.
+        """
+        with torch.no_grad():
+            end_points = self.net(end_points)
+            grasp_preds = pred_decode(end_points)
+        gg_array = grasp_preds[0].detach().cpu().numpy()
+        return GraspGroup(gg_array)
+    
+    def filter_collisions(self, grasp_group: GraspGroup, cloud: o3d.geometry.PointCloud) -> GraspGroup:
+        """Filters predicted grasps by checking for collisions with the scene point cloud.
+
+        Args:
+            grasp_group (GraspGroup): The predicted grasps.
+            cloud (o3d.geometry.PointCloud): The scene point cloud to check against.
+
+        Returns:
+            GraspGroup: The filtered grasps (those not in collision).
+        """
+        if self.collision_thresh <= 0:
+            return grasp_group
+        mfcdetector = ModelFreeCollisionDetector(np.asarray(cloud.points), voxel_size=self.voxel_size)
+        collision_mask = mfcdetector.detect(grasp_group, approach_dist=0.05, 
+                                          collision_thresh=self.collision_thresh)
+        return grasp_group[~collision_mask]
+    
+    def visualize_grasps(self, grasp_group: GraspGroup, cloud: o3d.geometry.PointCloud, top_k: int = 50) -> None:
+        """Visualizes the top K grasps along with the scene point cloud using Open3D.
+        Args:
+            grasp_group (GraspGroup): The grasps to visualize.
+            cloud (o3d.geometry.PointCloud): The scene point cloud.
+            top_k (int, optional): The number of top grasps to visualize. Defaults to 50.
+        """
+        grasp_group.nms()
+        grasp_group.sort_by_score()
+        grasp_group = grasp_group[:top_k]
+        grippers = grasp_group.to_open3d_geometry_list()
+        o3d.visualization.draw_geometries([cloud, *grippers])
+    
+    def detect(
+        self,
+        color_image: np.ndarray,
+        depth_image: np.ndarray,
+        workspace_mask: np.ndarray,
+        intrinsics: o3d.camera.PinholeCameraIntrinsic,
+        depth_scale: float = 1.0,
+        visualize: bool = True,
+    ) -> Tuple[GraspGroup, o3d.geometry.PointCloud]:
+        """Main method to process images and detect grasps.
+
+        Combines data processing, grasp prediction, collision filtering, and optional visualization.
+
+        Args:
+            color_image (np.ndarray): The BGR color image.
+            depth_image (np.ndarray): The depth image (raw values).
+            workspace_mask (np.ndarray): A boolean mask defining the valid workspace area.
+            intrinsics (o3d.camera.PinholeCameraIntrinsic): Open3D camera intrinsic parameters.
+            depth_scale (float, optional): Factor to convert depth values to meters. Defaults to 1.0.
+            visualize (bool, optional): Whether to visualize the resulting grasps. Defaults to True.
+
+        Returns:
+            Tuple[GraspGroup, o3d.geometry.PointCloud]: A tuple containing:
+                - grasp_group (GraspGroup): The final filtered grasps.
+                - cloud (o3d.geometry.PointCloud): The processed point cloud used for detection.
+        """
+        end_points, cloud = self.process_data(color_image, depth_image, workspace_mask, intrinsics, depth_scale)
+        grasp_group = self.predict_grasps(end_points)
+        grasp_group = self.filter_collisions(grasp_group, cloud)
+        
+        if visualize:
+            self.visualize_grasps(grasp_group, cloud)
+            
+        return grasp_group, cloud
