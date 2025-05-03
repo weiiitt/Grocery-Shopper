@@ -182,6 +182,12 @@ right_gripper_enc=robot.getDevice("gripper_right_finger_joint_sensor")
 left_gripper_enc.enable(timestep)
 right_gripper_enc.enable(timestep)
 
+# Enable wheel encoders
+left_wheel_enc=robot.getDevice("wheel_left_joint").getPositionSensor()
+right_wheel_enc=robot.getDevice("wheel_right_joint").getPositionSensor()
+left_wheel_enc.enable(timestep)
+right_wheel_enc.enable(timestep)
+
 # Enable Range Finder
 range_finder = robot.getDevice('depth_camera')
 range_finder.enable(timestep)
@@ -649,6 +655,10 @@ while robot.step(timestep) != -1:
     SAM_view_display.setColor(0x000000)
     SAM_view_display.fillRectangle(0, 0, 640, 480)
     # draw_detected_objects()
+    
+    #TODO investigating BreezySLAM, can pass lidar and odometry to create a localized map. 
+    # also learned that the wheels have encoders which will more accurately track then using vL and VR
+    print(left_wheel_enc.getValue())
     
     if joint_test: 
         joint_tester()
