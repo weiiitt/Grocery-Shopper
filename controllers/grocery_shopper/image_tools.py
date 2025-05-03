@@ -36,6 +36,7 @@ class ImageTools:
         self.fastsam_conf = fastsam_conf
         self.fastsam_iou = fastsam_iou
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+        print(f"CUDA Available: {torch.cuda.is_available()}")
         print("Models loaded.")
 
     def get_object_pose(self, depth_data, obj_file):

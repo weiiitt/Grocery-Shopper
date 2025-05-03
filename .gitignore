@@ -6,3 +6,4 @@ graspnetAPI/
 training_data/
 FusionVision/
 controllers/grocery_shopper/models/
+*.ini
