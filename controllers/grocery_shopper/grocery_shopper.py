@@ -1,6 +1,6 @@
 """grocery controller."""
 
-# Apr 1, 2025
+# May 3, 2025
 
 from controller import Robot
 import math
@@ -9,12 +9,16 @@ from image_tools import ImageTools
 import open3d as o3d
 from ikpy.chain import Chain
 
+from breezyslam.algorithms import RMHC_SLAM
+from breezyslam.sensors import Laser
+
 #Initialization
 print("=== Initializing Grocery Shopper...")
 #Consts
 MAX_SPEED = 7.0  # [rad/s]
 MAX_SPEED_MS = 0.633 # [m/s]
 AXLE_LENGTH = 0.4044 # m
+WHEEL_RADIUS = MAX_SPEED_MS / MAX_SPEED # m
 MOTOR_LEFT = 10
 MOTOR_RIGHT = 11
 N_PARTS = 12
@@ -26,6 +30,9 @@ ROBOT_MODE_TOGGLE_KEY = 'M' # Key to switch between drive and arm control
 CARTESIAN_STEP = 0.015 # Step size for arm control in meters
 ORIENTATION_STEP = 0.05 # Step size for arm orientation control in radians
 KEY_COOLDOWN_CYCLES = 10 # Number of simulation steps for key press cooldown
+
+SLAM_UPDATE_INTERVAL = 10 # Run SLAM every x simulation steps (Adjust as needed)
+step_counter = 0
 
 
 # Start in drive mode
@@ -131,7 +138,7 @@ print(f"--- IK Setup Complete. Active motors in motor_dict: {list(motor_dict.key
 target_pos = (0.0, 0.0, 0.35, 0.07, 1.02, -3.16, 1.27, 1.32, 0.0, 1.41, 'inf', 'inf',0.045,0.045)
 upper_shelf = (0.0, 0.0, 0.35, 0.447, 0.651, -1.439, 2.035, 1.845, 0.816, 1.983, 'inf', 'inf', 0.045, 0.045)
 above_basket = (0.0, 0.0, 0.35, 0.07, 0.619, -0.519, 2.290, 1.892, -1.353, 0.390, 'inf', 'inf', 0.045, 0.045)
-target_pos = upper_shelf
+target_pos = target_pos
 # Initialize head angles from target_pos
 current_head_yaw = target_pos[0]  # head_1_joint is the first element
 current_head_tilt = target_pos[1] # head_2_joint is the second element
@@ -212,20 +219,34 @@ lidar.enablePointCloud()
 display = robot.getDevice("display")
 SAM_view_display = robot.getDevice("SAM view")
 
+class HokuyoLaser(Laser):
+    def __init__(self):
+        super().__init__(scan_size=lidar.getHorizontalResolution(),
+                        scan_rate_hz=10,
+                        detection_angle_degrees=240,
+                         distance_no_detection_mm=int(LIDAR_SENSOR_MAX_RANGE * 1000))
 
-# Odometry
-pose_x     = 0
-pose_y     = 0
-pose_theta = 0
+# SLAM setup
+MAP_SIZE_PIXELS = 360
+MAP_SIZE_METERS = 30
 
-vL = 0
-vR = 0
+slam = RMHC_SLAM(HokuyoLaser(), MAP_SIZE_PIXELS, MAP_SIZE_METERS)
+mapbytes = bytearray(MAP_SIZE_PIXELS * MAP_SIZE_PIXELS)
+
+# Pose tracking variables
+prev_left_enc = left_wheel_enc.getValue()
+prev_right_enc = right_wheel_enc.getValue()
+# Store SLAM estimated pose (meters, radians)
+slam_pose_x, slam_pose_y, slam_pose_theta = 8, 10, 0
+
+accumulated_distance_m = 0.0
+accumulated_angle_rad = 0.0
 
 lidar_sensor_readings = [] # List to hold sensor readings
 lidar_offsets = np.linspace(-LIDAR_ANGLE_RANGE/2., +LIDAR_ANGLE_RANGE/2., LIDAR_ANGLE_BINS)
-lidar_offsets = lidar_offsets[83:len(lidar_offsets)-83] # Only keep lidar readings not blocked by robot chassis
-
-map = None
+# Filter the offsets the same way as the readings
+filtered_lidar_offsets_rad = lidar_offsets[83:len(lidar_offsets)-83]
+filtered_lidar_offsets_deg = np.degrees(filtered_lidar_offsets_rad).tolist() # Convert to degrees list for SLAM
 
 # Camera Intrinsics
 width = 640
@@ -656,9 +677,118 @@ while robot.step(timestep) != -1:
     SAM_view_display.fillRectangle(0, 0, 640, 480)
     # draw_detected_objects()
     
-    #TODO investigating BreezySLAM, can pass lidar and odometry to create a localized map. 
-    # also learned that the wheels have encoders which will more accurately track then using vL and VR
-    print(left_wheel_enc.getValue())
+    step_counter += 1
+
+    # --- Always Update Odometry ---
+    current_left_enc = left_wheel_enc.getValue()
+    current_right_enc = right_wheel_enc.getValue()
+
+    delta_left = (current_left_enc - prev_left_enc) * WHEEL_RADIUS
+    delta_right = (current_right_enc - prev_right_enc) * WHEEL_RADIUS
+
+    # Accumulate distance and angle change since last SLAM update
+    step_distance_m = (delta_left + delta_right) / 2.0
+    step_angle_rad = (delta_right - delta_left) / AXLE_LENGTH
+    accumulated_distance_m += step_distance_m
+    accumulated_angle_rad += step_angle_rad
+
+    # Update previous encoder values for the *next* step's calculation
+    prev_left_enc = current_left_enc
+    prev_right_enc = current_right_enc
+
+    # --- Run SLAM and Visualization Periodically ---
+    if step_counter % SLAM_UPDATE_INTERVAL == 0:
+        slam_updated_this_cycle = False # Flag to track if SLAM update was successful
+        # --- Get LiDAR Data (only when needed) ---
+        raw_scan = lidar.getRangeImage()
+        # Filter the raw scan the same way as the offsets
+        processed_scan_m = raw_scan[83:len(raw_scan)-83]
+        # Convert ranges to millimeters, handling max range
+        processed_scan_mm = []
+        for r in processed_scan_m:
+            if r >= LIDAR_SENSOR_MAX_RANGE or not np.isfinite(r):
+                processed_scan_mm.append(0)
+            else:
+                 processed_scan_mm.append(int(r * 1000))
+
+        # Ensure scan lengths match
+        if len(processed_scan_mm) != len(filtered_lidar_offsets_deg):
+            print(f"Warning: Scan points ({len(processed_scan_mm)}) != Offset angles ({len(filtered_lidar_offsets_deg)}). Skipping SLAM update.")
+        else:
+            # --- Update SLAM using accumulated odometry ---
+            # Calculate dx, dy based on *accumulated* distance and angle
+            dx_m = accumulated_distance_m * math.cos(accumulated_angle_rad / 2.0) # Approximation over the interval
+            dy_m = accumulated_distance_m * math.sin(accumulated_angle_rad / 2.0) # Approximation over the interval
+
+            # Check for NaN *before* conversion to int and SLAM update
+            if not math.isfinite(dx_m) or not math.isfinite(dy_m) or not math.isfinite(accumulated_angle_rad):
+                 print(f"Warning: NaN detected in odometry calculation (dx={dx_m}, dy={dy_m}, angle={accumulated_angle_rad}). Skipping SLAM update.")
+            else:
+                # Convert accumulated pose change to mm and degrees for BreezySLAM
+                pose_change_mm_deg = (int(dx_m * 1000), int(dy_m * 1000), math.degrees(accumulated_angle_rad))
+
+                # Update SLAM with scans (mm), accumulated pose change (mm, deg), and scan angles (deg)
+                try:
+                    slam.update(processed_scan_mm, pose_change_mm_deg, filtered_lidar_offsets_deg)
+                    slam_updated_this_cycle = True # Mark SLAM as updated
+
+                    # --- Get SLAM Output ---
+                    x_mm, y_mm, theta_deg = slam.getpos()
+                    # Check SLAM output for NaN as well
+                    if not math.isfinite(x_mm) or not math.isfinite(y_mm) or not math.isfinite(theta_deg):
+                        print(f"Warning: NaN detected in SLAM output (x={x_mm}, y={y_mm}, theta={theta_deg}). Using previous pose.")
+                        slam_updated_this_cycle = False # Treat as failed update if output is bad
+                    else:
+                        slam_pose_x = x_mm / 1000.0
+                        slam_pose_y = y_mm / 1000.0
+                        slam_pose_theta = math.radians(theta_deg)
+                        slam.getmap(mapbytes)
+
+                except Exception as e:
+                    print(f"Error during SLAM update or getpos/getmap: {e}")
+                    slam_updated_this_cycle = False # Mark as failed on exception
+
+
+        # Reset odometry accumulators for the next interval, regardless of SLAM success/failure this cycle
+        accumulated_distance_m = 0.0
+        accumulated_angle_rad = 0.0
+
+        # --- Visualization (only after successful SLAM update) ---
+        if slam_updated_this_cycle:
+            # Clear display
+            display.setColor(0x000000) # Black background
+            display.fillRectangle(0, 0, display.getWidth(), display.getHeight())
+
+            # Draw SLAM map
+            pixels_per_meter = MAP_SIZE_PIXELS / MAP_SIZE_METERS
+            map_display_width = min(MAP_SIZE_PIXELS, display.getWidth())
+            map_display_height = min(MAP_SIZE_PIXELS, display.getHeight())
+
+            for y in range(map_display_height):
+                for x in range(map_display_width):
+                    map_index = y * MAP_SIZE_PIXELS + x
+                    if map_index < len(mapbytes):
+                        map_val = mapbytes[map_index]
+                        color = 0x000000 # Black (unknown)
+                        if map_val == 255: color = 0xFFFFFF # White (occupied)
+                        elif map_val == 0: color = 0x555555 # Grey (clear)
+                        display.setColor(color)
+                        display.drawPixel(x, y)
+
+            # Draw robot position (estimated by SLAM)
+            map_center_x = MAP_SIZE_PIXELS / 2
+            map_center_y = MAP_SIZE_PIXELS / 2
+            robot_map_px = map_center_x + slam_pose_x * pixels_per_meter
+            robot_map_py = map_center_y - slam_pose_y * pixels_per_meter
+
+            if 0 <= robot_map_px < map_display_width and 0 <= robot_map_py < map_display_height:
+                display.setColor(0xFF0000)  # Red for robot
+                display.fillRectangle(int(robot_map_px) - 1, int(robot_map_py) - 1, 3, 3)
+        # else: # Optional: Clear display or show a message if SLAM was skipped
+            # display.setColor(0x000000)
+            # display.fillRectangle(0, 0, display.getWidth(), display.getHeight())
+            # display.drawText("SLAM Update Skipped", 10, 10)
+
     
     if joint_test: 
         joint_tester()
