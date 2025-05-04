@@ -8,6 +8,7 @@ import numpy as np
 from image_tools import ImageTools
 import open3d as o3d
 from arm_controller import ArmController
+from scipy.signal import convolve2d
 
 #Initialization
 print("=== Initializing Grocery Shopper...")
@@ -142,7 +143,15 @@ lidar_sensor_readings = [] # List to hold sensor readings
 lidar_offsets = np.linspace(-LIDAR_ANGLE_RANGE/2., +LIDAR_ANGLE_RANGE/2., LIDAR_ANGLE_BINS)
 lidar_offsets = lidar_offsets[83:len(lidar_offsets)-83] # Only keep lidar readings not blocked by robot chassis
 
-map = None
+# Map parameters
+map = np.zeros(shape=[360, 360])
+probability_step = 5e-3  # Small increment for probabilistic mapping
+min_display_threshold = 0.1  # Threshold for displaying obstacles on map
+
+# Map scale and offset parameters
+MAP_SCALE = 12  # pixels per meter
+MAP_OFFSET_X = 180  # Center of the map (x)
+MAP_OFFSET_Y = 180  # Center of the map (y)
 
 # Camera Intrinsics
 width = 640
@@ -211,123 +220,85 @@ def draw_detected_objects():
     else:
         return object_mask, depth_image, False
     
-# def joint_tester(tolerance=0.005, max_wait_steps=250):
-#     """
-#     Cycles each position-controlled joint through min -> max -> initial positions,
-#     waiting for completion using Position Sensors.
-#     Note: This function blocks execution while testing each joint.
-#     Requires Position Sensors to be enabled for all tested joints.
+def world_to_map(world_x, world_y):
+    """Convert world coordinates (meters) to map coordinates (pixels).
+    World origin is mapped to the center of the map.
+    """
+    # Convert from world coordinates to map coordinates
+    # Map origin is at the top-left corner
+    map_x = int(MAP_OFFSET_X + world_x * MAP_SCALE)
+    map_y = int(MAP_OFFSET_Y - world_y * MAP_SCALE)  # Y-axis is inverted
+    
+    # Ensure coordinates are within map boundaries
+    map_x = max(0, min(359, map_x))
+    map_y = max(0, min(359, map_y))
+    
+    return map_x, map_y
 
-#     Args:
-#         tolerance (float): Position tolerance in radians/meters to consider the target reached.
-#         max_wait_steps (int): Maximum simulation steps to wait before timing out.
-#     """
-#     print("=== Starting Joint Test (Sensor-Based Wait) ===")
-#     robot_parts["wheel_left_joint"].setVelocity(0)
-#     robot_parts["wheel_right_joint"].setVelocity(0)
+def map_to_world(map_x, map_y):
+    """Convert map coordinates (pixels) to world coordinates (meters)."""
+    world_x = (map_x - MAP_OFFSET_X) / MAP_SCALE
+    world_y = (MAP_OFFSET_Y - map_y) / MAP_SCALE  # Y-axis is inverted
+    return world_x, world_y
 
-#     # Filter part_names to only include those with sensors (i.e., not wheels)
-#     testable_joints = [name for name in part_names if name in robot_sensors]
-
-#     if not testable_joints:
-#         print("No testable joints with enabled sensors found. Aborting test.")
-#         return
-
-#     initial_positions = {}
-#     # Retrieve initial positions only for testable joints
-#     for name in testable_joints:
-#         # Find the corresponding index in the original target_pos tuple
-#         try:
-#             original_index = part_names.index(name)
-#             initial_positions[name] = float(target_pos[original_index])
-#         except (ValueError, IndexError):
-#             print(f"Warning: Could not find initial position for {name} in global target_pos. Using 0.0 as fallback.")
-#             initial_positions[name] = 0.0 # Fallback, adjust if needed
-
-
-#     # --- Helper function for waiting ---
-#     def wait_for_position(robot_joint, sensor, target_position, target_name, part_name, speed_factor):
-#         print(f"  Moving {part_name} to {target_name} ({target_position:.3f})...")
-#         robot_joint.setPosition(target_position)
-#         robot_joint.setVelocity(robot_joint.getMaxVelocity() * speed_factor)
-#         steps_waited = 0
-#         while steps_waited < max_wait_steps:
-#             if robot.step(timestep) == -1:
-#                 print("  Simulation stopped during wait.")
-#                 return False # Indicate simulation stopped
-
-#             current_pos = sensor.getValue()
-#             if abs(current_pos - target_position) < tolerance:
-#                 print(f"  Reached {target_name} position ({current_pos:.3f}) after {steps_waited} steps.")
-#                 return True # Indicate success
-
-#             steps_waited += 1
-
-#         # Loop finished without reaching target (timeout)
-#         final_pos = sensor.getValue()
-#         print(f"  Warning: Timeout waiting for {part_name} to reach {target_name}. Steps: {steps_waited}, Current pos: {final_pos:.3f}")
-#         return True # Indicate timeout occurred but continue test
-#     # --- End Helper function ---
-
-
-#     for part_name in testable_joints:
-#         robot_joint = robot_parts[part_name]
-#         sensor = robot_sensors[part_name] # Assumes sensor exists from the filter above
-#         initial_pos = initial_positions[part_name]
-
-#         if not (hasattr(robot_joint, 'getMinPosition') and hasattr(robot_joint, 'getMaxPosition')):
-#             print(f"Skipping joint {part_name} (does not have getMinPosition/getMaxPosition methods).")
-#             continue
-
-#         min_pos = robot_joint.getMinPosition()
-#         max_pos = robot_joint.getMaxPosition()
-
-#         # Handle potentially infinite limits reported by Webots
-#         if min_pos < -1e10 or max_pos > 1e10:
-#             print(f"Skipping joint {part_name} due to potentially infinite limits ({min_pos}, {max_pos}).")
-#             continue
-
-#         print(f"\nTesting joint: {part_name} (Min: {min_pos:.3f}, Max: {max_pos:.3f}, Initial: {initial_pos:.3f})")
-
-#         # Move to Min
-#         if not wait_for_position(robot_joint, sensor, min_pos, "Min", part_name, 0.5): return # Exit if simulation stopped
-
-#         # Move to Max
-#         if not wait_for_position(robot_joint, sensor, max_pos, "Max", part_name, 0.5): return # Exit if simulation stopped
-
-#         # Return to Initial Position
-#         if not wait_for_position(robot_joint, sensor, initial_pos, "Initial", part_name, 0.5): return # Exit if simulation stopped
-
-#         print(f"Finished testing {part_name}.")
-
-#     print("\n=== Joint Test Complete ===")
-
-# def get_robot_joints():
-#     global part_names, robot_sensors
-#     current_pose_list = []
-#     for name in part_names:
-#         if "wheel" in name:
-#             current_pose_list.append("'inf'") # Add as string to match target_pos format
-#         elif name == "gripper_left_finger_joint":
-#             current_pose_list.append(f"{left_gripper_enc.getValue():.3f}")
-#         elif name == "gripper_right_finger_joint":
-#                 current_pose_list.append(f"{right_gripper_enc.getValue():.3f}")
-#         elif name in robot_sensors:
-#             current_pose_list.append(f"{robot_sensors[name].getValue():.3f}")
+def load_map():
+    """Load a saved map from disk."""
+    global map
+    try:
+        loaded_map = np.load("map.npy")
+        if loaded_map.shape == (360, 360):
+            map = loaded_map.astype(np.float32)
             
-#     pose_str = "(" + ", ".join(current_pose_list) + ")"
-#     print(f"Current Pose: {pose_str}")
+            # Update the display with the loaded map
+            display.setColor(0x000000)
+            display.fillRectangle(0, 0, 360, 360)
+            
+            # Draw the actual map data
+            for x in range(360):
+                for y in range(360):
+                    if map[x, y] > 0.5:  # Only draw significant obstacles
+                        color = int(map[x, y] * 255)
+                        display.setColor((color << 16) | (color << 8) | color)
+                        display.drawPixel(x, y)
+            
+            print("Map loaded successfully")
+        else:
+            print("Error: Map dimensions don't match expected size (360x360)")
+    except Exception as e:
+        print(f"Error loading map: {e}")
+
+def save_map():
+    """Save the current map to disk."""
+    global map
+    try:
+        np.save("map.npy", map)
+        print("Map saved successfully")
+    except Exception as e:
+        print(f"Error saving map: {e}")
+
+def rotate_y(x,y,z,theta):
+    new_x = x*np.cos(theta) + y*np.sin(theta)
+    new_z = z
+    new_y = y*-np.sin(theta) + x*np.cos(theta)
+    return [-new_x, new_y, new_z]
 
 # Main Loop
 joint_test = False
 steps_taken = 0
 robot_pos = None
 obj_pos = None
+# Track modified pixels to avoid redrawing the entire map
+modified_pixels = set()
+map_needs_redraw = True
+
 while robot.step(timestep) != -1:
 
-
     steps_taken += 1
-    if steps_taken > 10:
+    
+    # Only do object detection and map redraw every 50 steps
+    should_update_display = (steps_taken % 50 == 0)
+    
+    if should_update_display:
         object_mask, depth_image, detected = draw_detected_objects()
         if detected:
             # if obj_pos is None:
@@ -335,12 +306,7 @@ while robot.step(timestep) != -1:
             print(f"Object Position: {obj_pos}")
             robot_pos = arm_controller.convert_camera_coord_to_robot_coord(obj_pos)
             print(f"Robot Relative Position: {robot_pos}")
-        steps_taken = 0
-            
-    # if joint_test: 
-    #     joint_tester()
-    #     joint_test = False
-
+    
     # --- Keyboard Input with Cooldown ---
     key_cooldown_timer = max(0, key_cooldown_timer - 1) # Decrement cooldown timer
     # bypass cooldown when driving
@@ -370,6 +336,83 @@ while robot.step(timestep) != -1:
         mode_just_changed = True
         key = -1 # Consume the mode switch key so it doesn't trigger actions
 
+    # Get GPS values and update pose
+    gps_values = gps.getValues()
+    pose_x = gps_values[0]  # Update pose_x with actual GPS x value
+    pose_y = gps_values[1]  # Update pose_y with actual GPS y value
+    
+    compass_values = compass.getValues()
+    compass_angle = math.atan2(compass_values[0], compass_values[1])
+    pose_theta = compass_angle  # Update pose_theta with actual compass angle
+    
+    lidar_sensor_readings = lidar.getRangeImage()
+    lidar_sensor_readings = lidar_sensor_readings[83:len(lidar_sensor_readings) - 83]
+    
+    # Always process LIDAR readings to update the map data structure
+    for i, rho in enumerate(lidar_sensor_readings):
+        alpha = lidar_offsets[i]
+        
+        if rho > LIDAR_SENSOR_MAX_RANGE:
+            continue
+        
+        # Calculate the obstacle position in robot's coordinate frame
+        obs_x_rel = math.cos(alpha) * rho
+        obs_y_rel = -math.sin(alpha) * rho
+        
+        # Convert to world coordinates by rotating and translating
+        # based on robot's position and orientation
+        obs_x = pose_x + obs_x_rel * math.cos(pose_theta) - obs_y_rel * math.sin(pose_theta)
+        obs_y = pose_y + obs_x_rel * math.sin(pose_theta) + obs_y_rel * math.cos(pose_theta)
+        
+        # Convert world coordinates to map coordinates
+        map_x, map_y = world_to_map(obs_x, obs_y)
+        
+        # Update map with obstacle information
+        if 0 <= map_x < 360 and 0 <= map_y < 360:
+            old_value = map[map_x, map_y]
+            pixel_value = old_value
+            if pixel_value < 1:
+                pixel_value += probability_step
+            pixel_value = min(1, pixel_value)
+            map[map_x, map_y] = pixel_value
+            
+            if abs(pixel_value - old_value) > 0.01:
+                map_needs_redraw = True
+    
+    # Only redraw the map every 50 steps or when map needs redraw after save/load
+    if should_update_display or map_needs_redraw:
+        # Clear the display to refresh the map view
+        display.setColor(0x000000)
+        display.fillRectangle(0, 0, 360, 360)
+        
+        # Calculate robot map position
+        robot_map_x, robot_map_y = world_to_map(pose_x, pose_y)
+        
+        # Draw the full map, skipping the robot's position
+        for x in range(360):
+            for y in range(360):
+                if (x == robot_map_x and y == robot_map_y):
+                    continue
+                    
+                if map[x, y] > 0.1:  # Lower threshold to show more features
+                    color = int(map[x, y] * 255)
+                    display.setColor((color << 16) | (color << 8) | color)
+                    display.drawPixel(x, y)
+        
+        # Draw robot position on map
+        display.setColor(0xFF0000)  # Red color for robot
+        display.drawPixel(robot_map_x, robot_map_y)
+        
+        # Draw robot heading indicator
+        heading_length = 5  # pixels
+        heading_x = robot_map_x + int(heading_length * math.cos(pose_theta))
+        heading_y = robot_map_y - int(heading_length * math.sin(pose_theta))
+        display.setColor(0x00FF00)  # Green color for heading
+        if 0 <= heading_x < 360 and 0 <= heading_y < 360:
+            display.drawLine(robot_map_x, robot_map_y, heading_x, heading_y)
+            
+        map_needs_redraw = False
+    
     # --- Mode-Specific Control ---
     if robot_mode == "drive":
         # Reset drive velocities at the start of drive mode loop iteration
@@ -392,8 +435,11 @@ while robot.step(timestep) != -1:
         # Handle other keyboard input in drive mode
         elif key == ord('C'):
             handle_capture()
+        elif key == ord('M'):  # Save map
+            save_map()
+        elif key == ord('L'):  # Load map
+            load_map()
         elif key == ord('P'):
-
             object_mask, depth_image, detected = draw_detected_objects()
             steps_taken = 0
             
@@ -414,7 +460,6 @@ while robot.step(timestep) != -1:
             else:
                 robot_pos = None
                 print("No object detected to approach.")
-
         elif key == keyboard.UP: # Head tilt up
             current_head_tilt = min(HEAD_TILT_MAX, current_head_tilt + HEAD_TILT_STEP)
             robot_parts["head_2_joint"].setPosition(current_head_tilt)
