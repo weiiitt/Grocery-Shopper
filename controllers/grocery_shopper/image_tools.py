@@ -169,8 +169,7 @@ class ImageTools:
         Returns:
             tuple: A tuple containing:
                 - overlay_image (np.ndarray): Color image with the selected object's YOLO box and FastSAM mask, or an empty array if result_image is False.
-                - object_masks (np.ndarray): Binary mask for the selected object (or empty array if no object).
-                - object_point_clouds (o3d.geometry.PointCloud): Point cloud for the selected object.
+                - object_mask (np.ndarray): Binary mask for the selected object (or empty array if no object).
                 - detections (List[dict]): List of detection dictionaries for the selected object.
         """
         # --- 1. YOLO Detection ---
@@ -178,13 +177,13 @@ class ImageTools:
         
         # Initialize overlay_image based on result_image flag
         overlay_image = color_image.copy() if result_image else np.array([])
-        object_masks = np.zeros((color_image.shape[0], color_image.shape[1]), dtype=bool)
-        object_point_clouds = o3d.geometry.PointCloud()
+        object_mask = np.zeros((color_image.shape[0], color_image.shape[1]), dtype=bool)
+        # object_point_clouds = o3d.geometry.PointCloud()
         selected_detection_list = [] # Will hold the single selected detection
 
         if not all_detections:
             print("No objects detected by YOLO.")
-            return overlay_image, object_masks, object_point_clouds, selected_detection_list
+            return overlay_image, object_mask, selected_detection_list
 
         # --- 2. Select the Best Object ---
         if len(all_detections) == 1:
@@ -211,7 +210,7 @@ class ImageTools:
             
         if selected_detection is None: # Should not happen if all_detections is not empty, but safety check
              print("Could not select a best object.")
-             return overlay_image, object_masks, object_point_clouds, selected_detection_list
+             return overlay_image, object_mask, selected_detection_list
 
         selected_detection_list.append(selected_detection)
         selected_bbox = list(map(int, selected_detection['bounding_box'])) # Use integers for bbox
@@ -227,7 +226,7 @@ class ImageTools:
                     x1, y1, x2, y2 = selected_bbox
                     cv2.rectangle(overlay_image, (x1, y1), (x2, y2), (255, 255, 0), 2)
                     cv2.putText(overlay_image, f"{selected_detection['class_name']}: {selected_detection['confidence']:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-                return overlay_image, object_masks, object_point_clouds, selected_detection_list
+                return overlay_image, object_mask, selected_detection_list
 
         prompt_process = FastSAMPrompt(color_image, fastsam_results, device=self.device)
         
@@ -241,7 +240,7 @@ class ImageTools:
                 x1, y1, x2, y2 = selected_bbox
                 cv2.rectangle(overlay_image, (x1, y1), (x2, y2), (255, 255, 0), 2)
                 cv2.putText(overlay_image, f"{selected_detection['class_name']}: {selected_detection['confidence']:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-            return overlay_image, object_masks, object_point_clouds, selected_detection_list
+            return overlay_image, object_mask, selected_detection_list
 
         # --- 4. Generate Overlay Image (Conditional) ---
         if result_image:
@@ -282,7 +281,7 @@ class ImageTools:
                 print(f"Warning: Mask shape {mask_np.shape} mismatch with image dimensions ({intrinsics.height}, {intrinsics.width}). Resizing.")
                 mask_np = cv2.resize(mask_np, (intrinsics.width, intrinsics.height), interpolation=cv2.INTER_NEAREST)
 
-            object_masks = mask_np > 0 # Store boolean mask
+            object_mask = mask_np > 0 # Store boolean mask
 
             # --- 6. Generate Object Point Cloud ---
             rows, cols = np.where(mask_np > 0)
@@ -294,25 +293,82 @@ class ImageTools:
             cols = cols[valid_depth_indices]
             depth_vals = depth_vals[valid_depth_indices]
 
-            if len(depth_vals) > 0:
-                fx = intrinsics.intrinsic_matrix[0, 0]
-                fy = intrinsics.intrinsic_matrix[1, 1]
-                cx = intrinsics.intrinsic_matrix[0, 2]
-                cy = intrinsics.intrinsic_matrix[1, 2]
+            # if len(depth_vals) > 0:
+            #     fx = intrinsics.intrinsic_matrix[0, 0]
+            #     fy = intrinsics.intrinsic_matrix[1, 1]
+            #     cx = intrinsics.intrinsic_matrix[0, 2]
+            #     cy = intrinsics.intrinsic_matrix[1, 2]
 
-                z = depth_vals / depth_scale
-                x = (cols - cx) * z / fx
-                y = (rows - cy) * z / fy
+            #     z = depth_vals / depth_scale
+            #     x = (cols - cx) * z / fx
+            #     y = (rows - cy) * z / fy
                 
-                points = np.vstack((x, y, z)).T
+            #     points = np.vstack((x, y, z)).T
 
-                obj_pcd = o3d.geometry.PointCloud()
-                obj_pcd.points = o3d.utility.Vector3dVector(points)
-                object_point_clouds = obj_pcd
-            else:
-                print(f"No valid depth points found for the selected object mask.")
-                object_point_clouds = o3d.geometry.PointCloud() # Add empty point cloud
+            #     obj_pcd = o3d.geometry.PointCloud()
+            #     obj_pcd.points = o3d.utility.Vector3dVector(points)
+            #     object_point_clouds = obj_pcd
+            # else:
+            #     print(f"No valid depth points found for the selected object mask.")
+            #     object_point_clouds = o3d.geometry.PointCloud() # Add empty point cloud
 
 
+        return overlay_image, object_mask, selected_detection_list
+        
+        
+    def get_object_coord(self, object_mask, depth_image, intrinsics: o3d.camera.PinholeCameraIntrinsic):
+        """
+        Get the centroid and depth value of the object in the depth image.
+        """
+        if not object_mask.any():
+            print("Warning: Empty mask passed to get_object_coord.")
+            return None
 
-        return overlay_image, object_masks, object_point_clouds, selected_detection_list
+        rows, cols = np.where(object_mask)
+        if len(rows) == 0: # Double check after np.where
+            print("Warning: Mask became empty after np.where in get_object_coord.")
+            return None
+
+        # Calculate centroid pixel coordinates
+        u = int(np.mean(cols))
+        v = int(np.mean(rows))
+
+        # Ensure centroid is within image bounds
+        h, w = depth_image.shape
+        if not (0 <= u < w and 0 <= v < h):
+            print(f"Warning: Calculated centroid ({u}, {v}) is outside image bounds ({w}x{h}).")
+            return None
+
+        # Get depth value at centroid
+        # Find the lowest (largest y value) point in the mask
+        lowest_y_index = np.argmax(rows)
+        lowest_v, lowest_u = rows[lowest_y_index], cols[lowest_y_index]
+        
+        # Get depth at the lowest point instead of centroid
+        depth_value = depth_image[lowest_v, lowest_u]
+
+        # Validate depth value (needs to be finite and positive)
+        if not np.isfinite(depth_value) or depth_value <= 0:
+            # Optional: Could try median depth of the mask instead
+            # valid_depths = depth_image[rows, cols]
+            # valid_depths = valid_depths[np.isfinite(valid_depths) & (valid_depths > 0)]
+            # if len(valid_depths) > 0:
+            #     depth_value = np.median(valid_depths)
+            # else:
+            print(f"Warning: Invalid depth value ({depth_value}) at centroid ({u}, {v}). Cannot calculate 3D coordinate.")
+            return None
+
+        # Extract intrinsics
+        fx = intrinsics.intrinsic_matrix[0, 0]
+        fy = intrinsics.intrinsic_matrix[1, 1]
+        cx = intrinsics.intrinsic_matrix[0, 2]
+        cy = intrinsics.intrinsic_matrix[1, 2]
+
+        # Deproject to camera coordinates
+        z = depth_value  # Assuming depth_image is already in meters
+        x = (u - cx) * z / fx
+        y = (v - cy) * z / fy
+
+        coord_3d = np.array([x, y, z])
+        # print(f"  Centroid: ({u}, {v}), Depth: {z:.3f}m -> Cam Coord: {coord_3d}")
+        return coord_3d
