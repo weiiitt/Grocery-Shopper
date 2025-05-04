@@ -23,8 +23,8 @@ class ImageTools:
         self,
         yolo_weight_path,
         fastsam_weight_path,
-        yolo_conf_threshold=0.9,
-        fastsam_conf=0.3,
+        yolo_conf_threshold=0.95,
+        fastsam_conf=0.5,
         fastsam_iou=0.7,
     ):
         # Initialize models here

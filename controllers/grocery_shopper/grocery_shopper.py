@@ -330,8 +330,8 @@ while robot.step(timestep) != -1:
         else:
             robot_mode = "drive"
             # When switching back to drive mode, make sure arm is in a safe position
-            arm_controller.set_arm_to_position(initial_arm_pos)
-            print(f"Switched to '{robot_mode}' mode. Reset arm to safe position.")
+            # arm_controller.set_arm_to_position(initial_arm_pos)
+            # print(f"Switched to '{robot_mode}' mode. Reset arm to safe position.")
         
         mode_just_changed = True
         key = -1 # Consume the mode switch key so it doesn't trigger actions
