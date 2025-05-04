@@ -1,0 +1,6 @@
+ikpy
+numpy
+open3d
+# Add other dependencies like torch, torchvision if needed by image_tools
+# ultralytics (for YOLO)
+# Add FastSAM dependencies if not included elsewhere 

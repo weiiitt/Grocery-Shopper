@@ -1104,4 +1104,19 @@
     <child link="cap screw"/>
     <origin xyz="0.0477 0.008 -0.0108" rpy="3.1415927 -1.5707927 3.1415927"/>
   </joint>
+
+  <!-- Virtual Camera Link and Joint -->
+  <joint name="head_2_rgb_camera_joint" type="fixed">
+    <parent link="head_2_link"/>
+    <child link="rgb_camera_optical_frame"/>
+    <!-- Adjust xyz (meters) and rpy (radians) for camera pose relative to head_2_link -->
+    <!-- Common optical frame: +Z forward, +X right, +Y down -->
+    <origin xyz="-0.01177 0.0800 -0.025" rpy="0 -1.5708 3.14159"/>
+  </joint>
+
+  <link name="rgb_camera_optical_frame">
+    <!-- No visual/collision needed for IK calculations -->
+  </link>
+  <!-- End Virtual Camera Link and Joint -->
+
 </robot>
