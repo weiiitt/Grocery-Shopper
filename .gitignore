@@ -8,3 +8,5 @@ FusionVision/
 controllers/grocery_shopper/models/
 controllers/grocery_shopper/runtime.ini
 *.ini
+controllers/grocery_shopper/__pycache__/
+*.pyc
