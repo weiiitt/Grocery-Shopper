@@ -95,7 +95,7 @@ class ArmController:
                 
         # Lock specific joints for IK
         disable_joint_names = [
-            "torso_lift_joint",  
+            # "torso_lift_joint",  
             "gripper_right_finger_joint", 
             "gripper_left_finger_joint"
         ]
@@ -717,6 +717,13 @@ class ArmController:
         original_velocities = {}
         print("Attempting to approach and grasp detected object...")
         
+        #unlock base
+        joint_name = "torso_lift_joint"
+        link_index = [i for i, link in enumerate(self.my_chain.links) 
+                             if link.name == joint_name][0]
+        if self.my_chain.active_links_mask[link_index]:
+            self.my_chain.active_links_mask[link_index] = True
+        
         # --- Step 1: Get object position in robot frame ---
         obj_pos = image_tools.get_object_coord(object_mask, depth_image, o3d_intrinsics)
         if obj_pos is None or not np.all(np.isfinite(obj_pos)):
@@ -1070,6 +1077,13 @@ class ArmController:
                 wheel_right.setVelocity(0)
         except KeyError:
             print("Wheel motors not available, skipping reverse.")
+        
+        #lock base
+        joint_name = "torso_lift_joint"
+        link_index = [i for i, link in enumerate(self.my_chain.links) 
+                             if link.name == joint_name][0]
+        if self.my_chain.active_links_mask[link_index]:
+            self.my_chain.active_links_mask[link_index] = False
         
         # --- Step 11: Move to final pose and open gripper ---
         print("Moving arm to final pose and releasing object...")
