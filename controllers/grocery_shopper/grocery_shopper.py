@@ -9,7 +9,13 @@ from image_tools import ImageTools
 import open3d as o3d
 from arm_controller import ArmController
 from scipy.signal import convolve2d
+from scipy.ndimage import binary_closing, binary_dilation
+from scipy.ndimage import label, find_objects
+from skimage.morphology import skeletonize
+from skimage.graph import route_through_array
 import queue
+from collections import deque
+import struct
 
 #Initialization
 print("=== Initializing Grocery Shopper...")
@@ -28,9 +34,9 @@ LIDAR_ANGLE_RANGE = math.radians(240)
 # --- Autonomous Navigation Parameters ---
 ROBOT_RADIUS_M = 1 # Approximate radius of the robot base
 OBSTACLE_THRESHOLD = 0.7 # Map probability threshold to consider a cell an obstacle for C-Space
-CONFIG_SPACE_UPDATE_INTERVAL = 50 # Update config space every N steps
+CONFIG_SPACE_UPDATE_INTERVAL = 500 # Update config space every N steps
 CHECK_FRONT_DISTANCE_M = 0.8 # How far ahead to check for obstacles in C-Space
-STRAIGHT_TARGET_DISTANCE_M = 1.5 # How far to plan straight paths
+STRAIGHT_TARGET_DISTANCE_M = 3 # How far to plan straight paths
 TURN_TARGET_SIDE_OFFSET_M = 0.7 # How far sideways to aim for a turn target
 TURN_TARGET_FORWARD_OFFSET_M = 1.0 # How far forward to aim for a turn target
 PATH_FOLLOW_LOOKAHEAD_DIST = 0.5 # Lookahead distance for path follower (meters) - Not used in current simple follower
@@ -42,6 +48,38 @@ PATH_FOLLOW_ALPHA_LOW = 0.1 # Radians (~5.7 deg). Below this, mostly forward.
 PATH_FOLLOW_STEERING_GAIN = 0.3 # Gain for steering correction
 PATH_FOLLOW_MAX_TURN_SPEED = MAX_SPEED / 4.0 # Max speed during pure rotation
 PATH_FOLLOW_FORWARD_SPEED_FACTOR = 0.5 # Base speed factor when moving forward (can be adjusted)
+
+# --- C-Space Generation Parameters ---
+UNKNOWN_THRESHOLD = 0.1 # Map probability threshold below which is considered 'unknown' for C-Space generation
+# Size of the kernel for morphological closing (pixels). Larger values fill bigger gaps in known space,
+# meaning only *very* large unknown areas will be blocked in C-Space. Must be odd.
+MIN_UNKNOWN_AREA_CLOSING_KERNEL_SIZE = 15
+
+# --- Aisle/Hallway Detection ---
+# Define colors for visualization
+COLOR_FREE_SPACE_UNKNOWN = 0xFFFFFF # White (Default background)
+COLOR_CSPACE_OBSTACLE = 0x808080 # Gray
+COLOR_AISLE_GUESS = 0xADD8E6 # Light Blue
+COLOR_HALLWAY_GUESS = 0xFFFFE0 # Light Yellow
+COLOR_BOUNDARY = 0x000000 # Black for boundaries
+# Simple classification thresholds (adjust based on observation)
+MIN_REGION_AREA_PIXELS = 50 # Ignore very small free space regions
+# AISLE_MAX_ASPECT_RATIO_NARROW = 0.3 # width/height or height/width - REMOVED
+# HALLWAY_MIN_ASPECT_RATIO_SQUARE = 0.7 # Closer to 1 - REMOVED
+OBSTACLE_CHECK_FRACTION = 0.8 # Min fraction of pixels above/below bbox that must be obstacles to be an aisle
+# Helper function to convert hex color to RGBA bytes for imageNew
+def hex_to_rgba(hex_color):
+    r = (hex_color >> 16) & 0xFF
+    g = (hex_color >> 8) & 0xFF
+    b = hex_color & 0xFF
+    return struct.pack('BBBB', b, g, r, 255) # BGRA order for Webots Display
+
+# Precompute RGBA colors
+RGBA_FREE_SPACE_UNKNOWN = hex_to_rgba(COLOR_FREE_SPACE_UNKNOWN)
+RGBA_CSPACE_OBSTACLE = hex_to_rgba(COLOR_CSPACE_OBSTACLE)
+RGBA_AISLE_GUESS = hex_to_rgba(COLOR_AISLE_GUESS)
+RGBA_HALLWAY_GUESS = hex_to_rgba(COLOR_HALLWAY_GUESS)
+RGBA_BOUNDARY = hex_to_rgba(COLOR_BOUNDARY) # Although boundary pixels aren't explicitly drawn with this color now
 
 
 
@@ -244,36 +282,157 @@ keyboard.enable(timestep)
 
 # --- Autonomous Navigation Functions ---
 
-def create_configuration_space(occupancy_map, robot_radius_pixels, obstacle_threshold):
-    """Creates the configuration space map by dilating obstacles."""
-    print(f"Updating C-Space (Radius: {robot_radius_pixels} px, Threshold: {obstacle_threshold})")
-    # 1. Identify Obstacles based on threshold
-    obstacles = occupancy_map >= obstacle_threshold
+def create_configuration_space(occupancy_map, robot_radius_pixels, obstacle_threshold,
+                               unknown_threshold=UNKNOWN_THRESHOLD, # Use global constant as default
+                               closing_kernel_size=MIN_UNKNOWN_AREA_CLOSING_KERNEL_SIZE): # Use global constant
+    """
+    Creates the configuration space map by dilating obstacles AND marking large unknown areas as obstacles.
 
-    # Convert boolean obstacles to integer (0 or 1)
-    obstacles_int = obstacles.astype(int) # <-- ADDED conversion
+    Args:
+        occupancy_map (np.array): The probability map (0.0 to 1.0).
+        robot_radius_pixels (int): The robot radius in pixels for dilation.
+        obstacle_threshold (float): Probability threshold to consider a cell a definite obstacle.
+        unknown_threshold (float): Probability threshold below which a cell is considered unknown.
+        closing_kernel_size (int): Size of the square kernel used for morphological closing
+                                   to identify large unknown areas. Larger values treat larger
+                                   contiguous unknown areas as obstacles. Must be odd.
+    """
+    print(f"Updating C-Space (Radius: {robot_radius_pixels} px, Obs Thresh: {obstacle_threshold}, Unk Thresh: {unknown_threshold}, Closing Kernel: {closing_kernel_size})")
 
-    # 2. Convolution (Dilation)
+    # --- Step 1: Identify definite obstacles based on threshold ---
+    definite_obstacles = occupancy_map >= obstacle_threshold
+
+    # # --- Step 2: Identify large unknown areas ---
+    # # Treat areas below the unknown_threshold as potentially unknown/unexplored
+    # potentially_unknown = occupancy_map < unknown_threshold
+
+    # # Identify *known* areas (areas that are NOT potentially unknown)
+    # known_space = ~potentially_unknown
+
+    # # Define the structuring element for closing (a square kernel)
+    # # Ensure kernel size is odd
+    # if closing_kernel_size % 2 == 0:
+    #     print(f"Warning: Closing kernel size ({closing_kernel_size}) must be odd. Incrementing to {closing_kernel_size + 1}.")
+    #     closing_kernel_size += 1
+    # structure = np.ones((closing_kernel_size, closing_kernel_size), dtype=bool)
+
+    # # Perform binary closing on the known space. This fills small holes (small unknown areas)
+    # # within the known space. Areas that remain False after this are large unknown regions
+    # # or areas outside the main known space.
+    # closed_known_space = binary_closing(known_space, structure=structure)
+
+    # # Identify areas to block: definite obstacles OR large unknown areas.
+    # # Large unknown areas are those that were 'potentially_unknown' AND are *not* part of the 'closed_known_space'.
+    # large_unknown_areas = potentially_unknown & (~closed_known_space)
+    combined_obstacles = definite_obstacles #| large_unknown_areas
+
+    # --- Step 3: Dilate the combined obstacles ---
     if robot_radius_pixels > 0:
-        # Create a square kernel for approximation
-        kernel_size = 2 * robot_radius_pixels + 1
-        # Kernel should also be integer
-        kernel = np.ones((kernel_size, kernel_size), dtype=int) # <-- Changed dtype to int
-        # Convolve using integer arrays
-        dilated_obstacles_int = convolve2d(obstacles_int, kernel, mode='same', boundary='fill', fillvalue=0) # <-- Use int arrays
-        # Convert result back to boolean: True where convolution result > 0
-        dilated_obstacles = dilated_obstacles_int > 0 # <-- Convert back to boolean
-    else:
-        dilated_obstacles = obstacles # No dilation if radius is 0
+        # Create a dilation kernel (structuring element) based on robot radius
+        # Use a disk approximation or a simple square kernel
+        dilation_kernel_size = 2 * robot_radius_pixels + 1
+        # Using a square kernel for simplicity, like before
+        dilation_kernel = np.ones((dilation_kernel_size, dilation_kernel_size), dtype=bool)
 
-    # Ensure map boundaries are always obstacles in C-space
+        # Use binary_dilation (more efficient for this task than convolve2d)
+        dilated_obstacles = binary_dilation(combined_obstacles, structure=dilation_kernel)
+    else:
+        # No dilation if radius is 0
+        dilated_obstacles = combined_obstacles
+
+    # --- Step 4: Ensure map boundaries are always obstacles in C-space ---
     dilated_obstacles[0, :] = True
     dilated_obstacles[-1, :] = True
     dilated_obstacles[:, 0] = True
     dilated_obstacles[:, -1] = True
 
     print("C-Space update complete.")
-    return dilated_obstacles # True where robot center CANNOT go
+    # Return the final C-space map (True where robot center CANNOT go)
+    return dilated_obstacles
+
+def detect_free_space_skeleton(config_space, dilation_iterations=2):
+    """
+    Generates the skeleton of the free space and optionally dilates it slightly.
+
+    Args:
+        config_space (np.array): Boolean map (True=Obstacle).
+        dilation_iterations (int): How many steps to dilate the skeleton. 0 means no dilation.
+
+    Returns:
+        np.array: Boolean map where True indicates a skeleton pixel.
+    """
+    print("Generating free space skeleton...")
+    free_space = ~config_space
+    skel = skeletonize(free_space)
+
+    if dilation_iterations > 0:
+        # Dilate the skeleton but keep it within the original free space
+        dilated_skel = binary_dilation(skel, iterations=dilation_iterations) & free_space
+        print("Skeleton generation complete (dilated).")
+        return dilated_skel
+    else:
+        print("Skeleton generation complete (not dilated).")
+        return skel # Return the original skeleton if no dilation
+
+
+def detect_aisles_and_hallways(config_space):
+    """
+    Skeleton-based detection of hallways and aisles from a single connected free-space region.
+    Assumes aisles branch horizontally off a vertical hallway (like an 'E').
+    """
+    free_space = ~config_space
+    skel = skeletonize(free_space)
+
+    # Find the longest vertical skeleton path — the hallway spine
+    labeled_skel, num = label(skel)
+    region_class_map = np.zeros_like(config_space, dtype=np.uint8)
+    max_len = 0
+    hallway_label = 0
+
+    for i in range(1, num + 1):
+        coords = np.argwhere(labeled_skel == i)
+        ys = coords[:, 0]
+        xs = coords[:, 1]
+
+        x_span = xs.max() - xs.min()
+        y_span = ys.max() - ys.min()
+
+        # Prefer tall vertical spans
+        if y_span > x_span and y_span > max_len:
+            max_len = y_span
+            hallway_label = i
+
+    # Hallway: region_class = 2
+    region_class_map[labeled_skel == hallway_label] = 2
+
+    # Aisles: other branches from hallway
+    aisle_mask = (skel & (labeled_skel != hallway_label))
+    region_class_map[aisle_mask] = 1
+
+    # --- Region Growing ---
+    grown_hallway = binary_dilation(region_class_map == 2, iterations=8) & free_space
+    grown_aisles = binary_dilation(region_class_map == 1, iterations=8) & free_space & ~grown_hallway
+
+    region_class_map[grown_hallway] = 2
+    region_class_map[grown_aisles] = 1
+
+    # --- Boundary detection ---
+    boundary_pixels = []
+    h, w = region_class_map.shape
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            val = region_class_map[x, y]
+            if val in [1, 2]:
+                neighbors = [
+                    region_class_map[x + 1, y],
+                    region_class_map[x - 1, y],
+                    region_class_map[x, y + 1],
+                    region_class_map[x, y - 1]
+                ]
+                if any((n != val and n in [1, 2]) for n in neighbors):
+                    boundary_pixels.append((x, y))
+
+    return region_class_map, boundary_pixels
 
 def heuristic(a, b):
     """Calculate Manhattan distance heuristic for A*."""
@@ -295,6 +454,8 @@ def path_planner(config_space_map, start_map, end_map):
     rows, cols = config_space_map.shape
     start_map = (int(start_map[0]), int(start_map[1]))
     end_map = (int(end_map[0]), int(end_map[1]))
+    
+    end_map = get_closest_valid_point(config_space_map,end_map)
 
     # Bounds check for start/end
     if not (0 <= start_map[0] < rows and 0 <= start_map[1] < cols):
@@ -385,6 +546,27 @@ def normalize_angle(angle):
     while angle < -math.pi:
         angle += 2 * math.pi
     return angle
+
+def get_closest_valid_point(map, point):
+        """Find the closest valid (non-obstacle) point to the given point on the map."""
+        x, y = int(point[0]), int(point[1])
+        
+        # If the point is already valid, return it
+        if 0 <= x < map.shape[1] and 0 <= y < map.shape[0] and map[y, x] == 0:
+            return (x, y)
+        
+        # Search in expanding circles
+        max_radius = 50
+        for radius in range(1, max_radius):
+            for i in range(-radius, radius + 1):
+                for j in range(-radius, radius + 1):
+                    if abs(i) == radius or abs(j) == radius:
+                        nx, ny = x + i, y + j
+                        if (0 <= nx < map.shape[1] and 0 <= ny < map.shape[0] and 
+                            map[ny, nx] == 0):
+                            return (nx, ny)
+        
+        return None
 
 def find_closest_point_index(path_world_coords, pose_x, pose_y):
     """Finds the index of the closest waypoint in the path to the robot."""
@@ -555,40 +737,66 @@ def find_straight_target(robot_map_x, robot_map_y, pose_theta, config_space, for
     return (target_x, target_y)
 
 def find_turn_target(robot_map_x, robot_map_y, pose_theta, config_space):
-    """Finds a target point around a corner (prioritizes left)."""
-    side_offset_pixels = int(TURN_TARGET_SIDE_OFFSET_M * MAP_SCALE)
-    forward_offset_pixels = int(TURN_TARGET_FORWARD_OFFSET_M * MAP_SCALE)
+    """Finds a target point around a corner by searching outwards."""
     rows, cols = config_space.shape
+    max_search_dist_pixels = int(STRAIGHT_TARGET_DISTANCE_M * MAP_SCALE * 1.5) # Max distance to search for a turn target
+    step_size = max(1, ROBOT_RADIUS_PIXELS // 2) # Search step size
 
-    # Define relative angles for checking left/right turns
+    # Define relative angles for checking left/right turns first
     turn_angles = {'left': math.pi / 2.0, 'right': -math.pi / 2.0}
 
     for direction, rel_angle in turn_angles.items():
-        turn_angle = pose_theta + rel_angle
+        target_angle = normalize_angle(pose_theta + rel_angle) # Angle to search along
 
-        # Calculate a potential target point:
-        # Start slightly ahead of the robot to represent the 'corner'
-        corner_check_dist_pixels = ROBOT_RADIUS_PIXELS * 1.5
-        corner_x = robot_map_x + int(corner_check_dist_pixels * math.cos(pose_theta))
-        corner_y = robot_map_y - int(corner_check_dist_pixels * math.sin(pose_theta))
+        # Search outwards from the robot position along the target angle
+        for dist in range(step_size, max_search_dist_pixels + step_size, step_size):
+            target_x = robot_map_x + int(dist * math.cos(target_angle))
+            target_y = robot_map_y - int(dist * math.sin(target_angle)) # Map Y inverted
 
-        # Project sideways and then forward from that corner point
-        target_x = corner_x + int(side_offset_pixels * math.cos(turn_angle)) + int(forward_offset_pixels * math.cos(pose_theta))
-        target_y = corner_y - int(side_offset_pixels * math.sin(turn_angle)) - int(forward_offset_pixels * math.sin(pose_theta)) # Map Y inverted
+            # Check bounds first
+            if not (0 <= target_x < rows and 0 <= target_y < cols):
+                # print(f"  Turn search ({direction}) hit bounds at dist {dist}.")
+                break # Stop searching in this direction if we hit map boundary
 
-        # Clamp target to map bounds
-        target_x = max(0, min(rows - 1, target_x))
-        target_y = max(0, min(cols - 1, target_y))
+            # Check if the target is valid (not in C-space)
+            if not config_space[target_x, target_y]:
+                # Found a valid point, now check if the path *towards* it is clear enough
+                # (Simple check: midpoint between robot and target)
+                mid_x = (robot_map_x + target_x) // 2
+                mid_y = (robot_map_y + target_y) // 2
+                if not config_space[mid_x, mid_y]:
+                    print(f"  Found {direction} turn target: map({target_x}, {target_y}) at dist {dist}")
+                    return (target_x, target_y)
+                # else:
+                    # print(f"  Turn target map({target_x}, {target_y}) valid, but midpoint blocked.")
+            # else:
+                # Point at this distance is blocked, continue searching further out
 
-        # Check if the calculated target is valid (not in C-space)
-        if not config_space[target_x, target_y]:
-            print(f"  Found {direction} turn target: map({target_x}, {target_y})")
-            return (target_x, target_y)
-        else:
-            print(f"  Proposed {direction} turn target map({target_x}, {target_y}) is in C-Space.")
+        # print(f"  No valid target found searching {direction}.")
 
+    # If specific left/right turns failed, try a wider angle search (fallback)
+    print("  Specific turns failed, trying wider angle search...")
+    num_angle_steps = 8 # Check 8 directions around the front
+    for i in range(1, num_angle_steps // 2 + 1):
+        for sign in [-1, 1]: # Check left and right symmetrically
+            rel_angle = sign * i * (math.pi / num_angle_steps) # Angles like +/- 22.5, +/- 45, +/- 67.5, +/- 90 deg
+            target_angle = normalize_angle(pose_theta + rel_angle)
 
-    print("  Could not find suitable turn target.")
+            for dist in range(step_size, max_search_dist_pixels + step_size, step_size):
+                target_x = robot_map_x + int(dist * math.cos(target_angle))
+                target_y = robot_map_y - int(dist * math.sin(target_angle))
+
+                if not (0 <= target_x < rows and 0 <= target_y < cols):
+                    break
+
+                if not config_space[target_x, target_y]:
+                    mid_x = (robot_map_x + target_x) // 2
+                    mid_y = (robot_map_y + target_y) // 2
+                    if not config_space[mid_x, mid_y]:
+                        print(f"  Found fallback turn target: map({target_x}, {target_y}) at angle {math.degrees(rel_angle):.1f} deg, dist {dist}")
+                        return (target_x, target_y)
+
+    print("  Could not find suitable turn target after wider search.")
     return None # No suitable target found
 
 def plan_new_path(start_map_coords, end_map_coords, config_space_map):
@@ -944,6 +1152,10 @@ odom_pose_theta = compass_angle
 vL = 0.0
 vR = 0.0
 
+region_classification_map = np.zeros_like(map, dtype=np.uint8)
+boundary_pixels = [] # Added global list for boundary pixels
+
+
 while robot.step(timestep) != -1:
 
     steps_taken += 1
@@ -1034,8 +1246,14 @@ while robot.step(timestep) != -1:
     # --- Update Configuration Space (Periodically) ---
     if steps_taken - last_config_space_update_step >= CONFIG_SPACE_UPDATE_INTERVAL:
         config_space = create_configuration_space(map, ROBOT_RADIUS_PIXELS, OBSTACLE_THRESHOLD)
+        # --- Generate Free Space Skeleton after C-Space update ---
+        # Use the new function, store result in a new variable
+        free_space_skeleton_map = detect_free_space_skeleton(config_space, dilation_iterations=2) # Adjust dilation as needed
+        # Remove the old boundary_pixels assignment:
+        # region_classification_map, boundary_pixels = detect_aisles_and_hallways(config_space)
+        # ---
         last_config_space_update_step = steps_taken
-        # map_needs_redraw = True # C-Space update doesn't require map redraw unless visualizing C-Space
+        map_needs_redraw = True # C-Space and skeleton map update requires redraw
 
     # --- Keyboard Input ---
     key_cooldown_timer = max(0, key_cooldown_timer - 1)
@@ -1184,21 +1402,33 @@ while robot.step(timestep) != -1:
     robot_parts["wheel_right_joint"].setVelocity(vR)
 
     # --- Display Update ---
+    # Increase the update interval further if needed
+    should_update_display = (steps_taken % 100 == 0) # Example: Update every 100 steps
+
     if should_update_display or map_needs_redraw:
-        # --- Main Map Display ---
-        display.setColor(0x000000)
-        display.fillRectangle(0, 0, 360, 360)
-
-        # Draw Occupancy Map
-        for x in range(360):
-            for y in range(360):
-                if map[x, y] > min_display_threshold: # Use threshold
-                    color_val = int(map[x, y] * 255)
+        # --- Main Map Display Optimization ---
+        # Create an RGBA image buffer for the main map
+        map_image_data = bytearray(360 * 360 * 4)
+        for y in range(360): # Iterate y first if map is (rows, cols) = (x, y)
+            for x in range(360):
+                idx = (y * 360 + x) * 4
+                prob = map[x, y]
+                if prob > min_display_threshold:
+                    color_val = int(prob * 255)
                     color_val = max(0, min(255, color_val))
-                    packed_color = (color_val << 16) | (color_val << 8) | color_val
-                    display.setColor(packed_color)
-                    display.drawPixel(x, y)
+                    # Set BGRA bytes
+                    map_image_data[idx:idx+4] = struct.pack('BBBB', color_val, color_val, color_val, 255)
+                else:
+                    # Background color (e.g., black)
+                    map_image_data[idx:idx+4] = struct.pack('BBBB', 0, 0, 0, 255)
 
+        # Draw the map image
+        # Convert bytearray to bytes before passing to imageNew
+        map_ref = display.imageNew(bytes(map_image_data), display.BGRA, 360, 360)
+        display.imagePaste(map_ref, 0, 0, blend=False)
+        display.imageDelete(map_ref) # Clean up image reference
+
+        # --- Draw Overlays on Main Map ---
         # Draw GPS Path (Blue)
         display.setColor(0x0000FF)
         if len(robot_gps_path) > 1:
@@ -1207,39 +1437,35 @@ while robot.step(timestep) != -1:
                 p2_x, p2_y = world_to_map(robot_gps_path[i+1][0], robot_gps_path[i+1][1])
                 display.drawLine(p1_x, p1_y, p2_x, p2_y)
 
-        # Draw Planned Path (Cyan) on Main Display
+        # Draw Planned Path (Cyan)
         if current_path:
             display.setColor(0x00FFFF) # Cyan
             path_map_coords = [world_to_map(wp[0], wp[1]) for wp in current_path]
-            robot_map_x_main, robot_map_y_main = world_to_map(pose_x, pose_y) # Use different var names
+            robot_map_x_main, robot_map_y_main = world_to_map(pose_x, pose_y)
             if path_map_coords:
-                # Draw line from robot to the first *actual* waypoint being targeted (closest + lookahead)
-                # This requires finding the target index again, or passing it out
-                # For simplicity, just draw the full path for now.
-                # A better visualization would highlight the current lookahead target.
                 display.drawLine(robot_map_x_main, robot_map_y_main, path_map_coords[0][0], path_map_coords[0][1])
                 for i in range(len(path_map_coords) - 1):
                     display.drawLine(path_map_coords[i][0], path_map_coords[i][1], path_map_coords[i+1][0], path_map_coords[i+1][1])
 
-            # Highlight the furthest point reached (optional visualization)
+            # Highlight furthest point (Yellow)
             if furthest_path_index < len(path_map_coords):
-                display.setColor(0xFFFF00) # Yellow for furthest reached
+                display.setColor(0xFFFF00)
                 f_map_x, f_map_y = path_map_coords[furthest_path_index]
                 display.fillOval(f_map_x, f_map_y, 2, 2)
 
-            # Highlight the lookahead target point (optional visualization)
-            # Use current_path instead of path_world_coords which is not defined here
+            # Highlight lookahead target (Magenta)
             lookahead_target_index = min(furthest_path_index + PATH_FOLLOW_LOOKAHEAD_INDEX, len(current_path) - 1)
-            if lookahead_target_index < len(path_map_coords):
-                display.setColor(0xFF00FF) # Magenta target waypoint
+            if lookahead_target_index >= 0 and lookahead_target_index < len(path_map_coords):
+                display.setColor(0xFF00FF)
                 target_map_x, target_map_y = path_map_coords[lookahead_target_index]
+                display.fillOval(target_map_x, target_map_y, 3, 3) # Make target slightly bigger
 
-        # Draw Robot Position (Red) on Main Display
+        # Draw Robot Position (Red)
         robot_map_x_main, robot_map_y_main = world_to_map(pose_x, pose_y)
         display.setColor(0xFF0000)
         display.fillOval(robot_map_x_main, robot_map_y_main, 3, 3)
 
-        # Draw Robot Heading (Green) on Main Display
+        # Draw Robot Heading (Green)
         heading_length = 5
         heading_x_main = robot_map_x_main + int(heading_length * math.cos(pose_theta))
         heading_y_main = robot_map_y_main - int(heading_length * math.sin(pose_theta))
@@ -1248,54 +1474,65 @@ while robot.step(timestep) != -1:
             display.drawLine(robot_map_x_main, robot_map_y_main, heading_x_main, heading_y_main)
 
 
-        # --- C-Space Display ---
-        if cspace_display: # Check if the display exists
-            cspace_display.setColor(0xFFFFFF) # White background for free space
-            cspace_display.fillRectangle(0, 0, 360, 360)
+        # --- C-Space Display Optimization ---
+        if cspace_display:
+            # Create an RGBA image buffer for the C-space map
+            cspace_image_data = bytearray(360 * 360 * 4)
+            # Ensure free_space_skeleton_map exists and has the right shape
+            has_skeleton_map = ('free_space_skeleton_map' in globals() and
+                                free_space_skeleton_map is not None and
+                                free_space_skeleton_map.shape == (360, 360))
 
-            # Draw C-Space Obstacles (Gray)
-            cspace_display.setColor(0x808080) # Gray
-            # Ensure config_space has been calculated at least once
-            if 'config_space' in globals() and config_space is not None and config_space.shape == (360, 360):
+            for y in range(360): # Iterate y first
                 for x in range(360):
-                    for y in range(360):
-                        if config_space[x, y]: # True means obstacle in C-Space
-                            cspace_display.drawPixel(x, y)
-            else:
-                # Optionally draw a message if C-space not ready
-                cspace_display.setColor(0x000000)
-                cspace_display.setFont("Arial", 10, True)
-                cspace_display.drawText("C-Space not calculated", 10, 10)
+                    idx = (y * 360 + x) * 4
+                    if config_space[x, y]:
+                        cspace_image_data[idx:idx+4] = RGBA_CSPACE_OBSTACLE
+                    # Check if this pixel is part of the skeleton
+                    elif has_skeleton_map and free_space_skeleton_map[x, y]:
+                        # Use a single color for the skeleton (e.g., Light Blue)
+                        cspace_image_data[idx:idx+4] = RGBA_AISLE_GUESS
+                    else: # Otherwise, it's free space (not obstacle, not skeleton)
+                        cspace_image_data[idx:idx+4] = RGBA_FREE_SPACE_UNKNOWN
+
+            # Draw the C-space image
+            # Convert bytearray to bytes before passing to imageNew
+            cspace_ref = cspace_display.imageNew(bytes(cspace_image_data), cspace_display.BGRA, 360, 360)
+            cspace_display.imagePaste(cspace_ref, 0, 0, blend=False)
+            cspace_display.imageDelete(cspace_ref)
 
 
-            # Draw Planned Path (Cyan) on C-Space Display
+            # --- Draw Overlays on C-Space Map ---
+            # Draw Planned Path (Cyan)
             if current_path:
                 cspace_display.setColor(0x00FFFF) # Cyan
-                path_map_coords_cspace = [world_to_map(wp[0], wp[1]) for wp in current_path] # Recalculate for clarity
-                robot_map_x_cspace, robot_map_y_cspace = world_to_map(pose_x, pose_y)
-                if path_map_coords_cspace:
-                    cspace_display.drawLine(robot_map_x_cspace, robot_map_y_cspace, path_map_coords_cspace[0][0], path_map_coords_cspace[0][1])
-                    for i in range(len(path_map_coords_cspace) - 1):
-                        cspace_display.drawLine(path_map_coords_cspace[i][0], path_map_coords_cspace[i][1], path_map_coords_cspace[i+1][0], path_map_coords_cspace[i+1][1])
-                if path_index < len(path_map_coords_cspace):
-                    cspace_display.setColor(0xFF00FF) # Magenta target waypoint
-                    target_map_x_c, target_map_y_c = path_map_coords_cspace[path_index]
-                    cspace_display.fillOval(target_map_x_c, target_map_y_c, 3, 3)
+                # Assuming path_map_coords is still valid from main display section
+                robot_map_x_cspace, robot_map_y_cspace = world_to_map(pose_x, pose_y) # Use separate vars for clarity
+                if path_map_coords: # Check if path_map_coords was calculated
+                    cspace_display.drawLine(robot_map_x_cspace, robot_map_y_cspace, path_map_coords[0][0], path_map_coords[0][1])
+                    for i in range(len(path_map_coords) - 1):
+                        cspace_display.drawLine(path_map_coords[i][0], path_map_coords[i][1], path_map_coords[i+1][0], path_map_coords[i+1][1])
 
-            # Draw Robot Position (Red) on C-Space Display
+                # Highlight lookahead target (Magenta)
+                # Assuming lookahead_target_index is still valid
+                if lookahead_target_index >= 0 and lookahead_target_index < len(path_map_coords):
+                     cspace_display.setColor(0xFF00FF) # Magenta target waypoint
+                     target_map_x_c, target_map_y_c = path_map_coords[lookahead_target_index]
+                     cspace_display.fillOval(target_map_x_c, target_map_y_c, 3, 3)
+
+            # Draw Robot Position (Red)
             robot_map_x_cspace, robot_map_y_cspace = world_to_map(pose_x, pose_y)
             cspace_display.setColor(0xFF0000)
             cspace_display.fillOval(robot_map_x_cspace, robot_map_y_cspace, 3, 3)
 
-            # Draw Robot Heading (Green) on C-Space Display
+            # Draw Robot Heading (Green)
             heading_x_cspace = robot_map_x_cspace + int(heading_length * math.cos(pose_theta))
             heading_y_cspace = robot_map_y_cspace - int(heading_length * math.sin(pose_theta))
             cspace_display.setColor(0x00FF00)
             if 0 <= heading_x_cspace < 360 and 0 <= heading_y_cspace < 360:
                 cspace_display.drawLine(robot_map_x_cspace, robot_map_y_cspace, heading_x_cspace, heading_y_cspace)
 
-
-        map_needs_redraw = False # Reset flag after drawing both displays
+        map_needs_redraw = False # Reset flag after drawing
 
     # --- Update Arm/Gripper Status ---
     arm_controller.update_gripper_status()
