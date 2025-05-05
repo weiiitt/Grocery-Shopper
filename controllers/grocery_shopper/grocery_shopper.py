@@ -17,6 +17,8 @@ import queue
 from collections import deque
 import struct
 
+
+print("TODO: change autonomous mode to look for aisles going horizontal and drive to that if a straight spline is found")
 #Initialization
 print("=== Initializing Grocery Shopper...")
 #Consts
@@ -38,14 +40,14 @@ CONFIG_SPACE_UPDATE_INTERVAL = 100 # Update config space every N steps
 CHECK_FRONT_DISTANCE_M = 0.8 # How far ahead to check for obstacles in C-Space
 STRAIGHT_TARGET_DISTANCE_M = 3 # How far to plan straight paths
 TURN_TARGET_SIDE_OFFSET_M = 0.7 # How far sideways to aim for a turn target
-TURN_TARGET_FORWARD_OFFSET_M = 1.0 # How far forward to aim for a turn target
+TURN_TARGET_FORWARD_OFFSET_M = 0 # How far forward to aim for a turn target
 PATH_FOLLOW_LOOKAHEAD_DIST = 0.5 # Lookahead distance for path follower (meters) - Not used in current simple follower
 PATH_FOLLOW_GOAL_TOLERANCE = 0.30 # Tolerance to consider waypoint reached (meters)
-PATH_FOLLOW_KP_ANGULAR = 1.0 # Proportional gain for angular velocity in path follower
+PATH_FOLLOW_KP_ANGULAR = 8.0 # Proportional gain for angular velocity in path follower
 PATH_FOLLOW_LOOKAHEAD_INDEX = 4 # How many waypoints ahead to look from the closest point
 PATH_FOLLOW_ALPHA_HIGH = 0.5 # Radians (~28 deg). Above this, pure rotation.
 PATH_FOLLOW_ALPHA_LOW = 0.1 # Radians (~5.7 deg). Below this, mostly forward.
-PATH_FOLLOW_STEERING_GAIN = 0.3 # Gain for steering correction
+PATH_FOLLOW_STEERING_GAIN = 0.2 # Gain for steering correction
 PATH_FOLLOW_MAX_TURN_SPEED = MAX_SPEED / 4.0 # Max speed during pure rotation
 PATH_FOLLOW_FORWARD_SPEED_FACTOR = 0.5 # Base speed factor when moving forward (can be adjusted)
 
