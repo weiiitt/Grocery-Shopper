@@ -34,7 +34,7 @@ LIDAR_ANGLE_RANGE = math.radians(240)
 # --- Autonomous Navigation Parameters ---
 ROBOT_RADIUS_M = 1 # Approximate radius of the robot base
 OBSTACLE_THRESHOLD = 0.7 # Map probability threshold to consider a cell an obstacle for C-Space
-CONFIG_SPACE_UPDATE_INTERVAL = 500 # Update config space every N steps
+CONFIG_SPACE_UPDATE_INTERVAL = 100 # Update config space every N steps
 CHECK_FRONT_DISTANCE_M = 0.8 # How far ahead to check for obstacles in C-Space
 STRAIGHT_TARGET_DISTANCE_M = 3 # How far to plan straight paths
 TURN_TARGET_SIDE_OFFSET_M = 0.7 # How far sideways to aim for a turn target
@@ -440,66 +440,81 @@ def heuristic(a, b):
     (x2, y2) = b
     return abs(x1 - x2) + abs(y1 - y2)
 
-def path_planner(config_space_map, start_map, end_map):
+def path_planner(config_space_map, skeleton_map, start_map, end_map): # Added skeleton_map
     """
-    Plans a path using A* algorithm on the configuration space.
+    Plans a path using A* algorithm constrained to the skeleton map.
     Args:
-        config_space_map (np.array): Boolean map (True=Obstacle).
-        start_map (tuple): (x, y) start coordinates in map pixels.
-        end_map (tuple): (x, y) end coordinates in map pixels.
+        config_space_map (np.array): Boolean map (True=Obstacle). Used for final checks.
+        skeleton_map (np.array): Boolean map (True=Valid path pixel).
+        start_map (tuple): (x, y) start coordinates snapped to skeleton.
+        end_map (tuple): (x, y) end coordinates snapped to skeleton.
     Returns:
         list: A list of (x, y) map coordinates representing the path, or None if no path found.
     """
-    print(f"Planning path from {start_map} to {end_map}...")
-    rows, cols = config_space_map.shape
-    start_map = (int(start_map[0]), int(start_map[1]))
-    end_map = (int(end_map[0]), int(end_map[1]))
-    
-    end_map = get_closest_valid_point(config_space_map,end_map)
+    print(f"Planning skeleton path from {start_map} to {end_map}...")
+    rows, cols = config_space_map.shape # Use config_space for shape/bounds
 
-    # Bounds check for start/end
+    # Basic checks (start/end should already be snapped to skeleton and valid)
+    if start_map is None or end_map is None:
+        print("Error: Start or end node for skeleton planning is None.")
+        return None
     if not (0 <= start_map[0] < rows and 0 <= start_map[1] < cols):
         print(f"Error: Start node {start_map} is out of bounds.")
         return None
     if not (0 <= end_map[0] < rows and 0 <= end_map[1] < cols):
         print(f"Error: End node {end_map} is out of bounds.")
         return None
-
-    # Obstacle check for start/end
-    if config_space_map[start_map]:
-        print(f"Error: Start node {start_map} is in an obstacle.")
-        return None
-    if config_space_map[end_map]:
-        print(f"Error: End node {end_map} is in an obstacle.")
-        return None
+    if not skeleton_map[start_map]:
+         print(f"Error: Start node {start_map} is not on the skeleton.")
+         # Try finding closest again as a fallback? Or just fail.
+         # start_map = find_closest_skeleton_point(skeleton_map, start_map, 5) # Small radius retry
+         # if start_map is None or not skeleton_map[start_map]:
+         return None
+    if not skeleton_map[end_map]:
+         print(f"Error: End node {end_map} is not on the skeleton.")
+         # end_map = find_closest_skeleton_point(skeleton_map, end_map, 5)
+         # if end_map is None or not skeleton_map[end_map]:
+         return None
+    # Optional: Final check against config_space (should be redundant if skeleton is derived from it)
+    if config_space_map[start_map] or config_space_map[end_map]:
+         print(f"Warning: Start {start_map} or End {end_map} is in C-Space despite being on skeleton?")
+         # return None # Decide if this should be fatal
 
     frontier = queue.PriorityQueue()
     frontier.put((0, start_map)) # Priority queue stores (priority, item)
     came_from = {start_map: None}
     cost_so_far = {start_map: 0}
 
-    max_iterations = config_space_map.size * 2 # Safety break, allow more iterations
+    max_iterations = skeleton_map.size # Safety break
     iterations = 0
+
+    path_found = False # Flag to indicate if goal was reached
 
     while not frontier.empty() and iterations < max_iterations:
         iterations += 1
         current_priority, current_node = frontier.get()
 
         if current_node == end_map:
-            print("Path found!")
+            print("Skeleton path found!")
+            path_found = True
             break # Goal reached
 
         # Explore neighbors (4-connectivity)
-        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]: # Add diagonals: , (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]: # Add diagonals if needed: , (1, 1), (1, -1), (-1, 1), (-1, -1)]:
             next_node = (current_node[0] + dx, current_node[1] + dy)
 
             # Check bounds
             if not (0 <= next_node[0] < rows and 0 <= next_node[1] < cols):
                 continue
 
-            # Check obstacles in config_space
-            if config_space_map[next_node]:
+            # --- KEY CHANGE: Check if neighbor is on the skeleton ---
+            if not skeleton_map[next_node]:
                 continue
+            # --- End Key Change ---
+
+            # Optional: Check obstacles in config_space (redundant if skeleton is correct)
+            # if config_space_map[next_node]:
+            #     continue
 
             # Cost: 1 for cardinal, sqrt(2) for diagonal (optional, use 1 for simplicity)
             move_cost = 1 # if dx == 0 or dy == 0 else math.sqrt(2)
@@ -509,19 +524,15 @@ def path_planner(config_space_map, start_map, end_map):
                 priority = new_cost + heuristic(end_map, next_node)
                 frontier.put((priority, next_node))
                 came_from[next_node] = current_node
-    else: # Loop finished without finding path or hit iteration limit
+
+    if not path_found: # Loop finished without finding path or hit iteration limit
         if iterations >= max_iterations:
-            print("Warning: A* hit max iterations.")
+            print("Warning: A* (Skeleton) hit max iterations.")
         elif frontier.empty():
-             print("Error: Path not found (frontier empty).")
-        else: # Path found, but loop exited via break
-             pass # This case is handled below
-        # If goal wasn't reached (loop finished naturally or max iterations)
-        if current_node != end_map:
-             return None
+             print("Error: Skeleton path not found (frontier empty).")
+        return None
 
-
-    # Reconstruct path
+    # Reconstruct path (same as before)
     path = []
     node = end_map
     while node is not None:
@@ -533,11 +544,12 @@ def path_planner(config_space_map, start_map, end_map):
     path.reverse() # Path is from start to end
 
     if not path or path[0] != start_map:
-        print("Error: Path reconstruction failed.")
+        print("Error: Skeleton path reconstruction failed.")
         return None
 
-    print(f"Path length: {len(path)} nodes.")
+    print(f"Skeleton path length: {len(path)} nodes.")
     return path
+
 
 def normalize_angle(angle):
     """Normalize angle to [-pi, pi]"""
@@ -567,6 +579,38 @@ def get_closest_valid_point(map, point):
                             return (nx, ny)
         
         return None
+    
+    
+def find_closest_skeleton_point(skeleton_map, point, max_radius=50):
+    """Find the closest point on the skeleton map to the given point."""
+    x, y = int(point[0]), int(point[1])
+    rows, cols = skeleton_map.shape
+
+    # Check bounds
+    if not (0 <= x < rows and 0 <= y < cols):
+        print(f"Warning: Point ({x},{y}) for skeleton search is out of bounds.")
+        return None # Point is outside map
+
+    # If the point is already on the skeleton, return it
+    if skeleton_map[x, y]:
+        return (x, y)
+
+    # Search in expanding squares
+    for radius in range(1, max_radius + 1):
+        min_r, max_r = max(0, x - radius), min(rows, x + radius + 1)
+        min_c, max_c = max(0, y - radius), min(cols, y + radius + 1)
+
+        # Check perimeter of the square
+        for r in range(min_r, max_r):
+            if min_c < cols and skeleton_map[r, min_c]: return (r, min_c) # Top edge
+            if max_c - 1 >= 0 and skeleton_map[r, max_c - 1]: return (r, max_c - 1) # Bottom edge
+        for c in range(min_c + 1, max_c - 1): # Exclude corners already checked
+            if min_r < rows and skeleton_map[min_r, c]: return (min_r, c) # Left edge
+            if max_r - 1 >= 0 and skeleton_map[max_r - 1, c]: return (max_r - 1, c) # Right edge
+
+    print(f"Warning: Could not find skeleton point near ({x},{y}) within radius {max_radius}.")
+    return None # No skeleton point found nearby
+
 
 def find_closest_point_index(path_world_coords, pose_x, pose_y):
     """Finds the index of the closest waypoint in the path to the robot."""
@@ -799,109 +843,126 @@ def find_turn_target(robot_map_x, robot_map_y, pose_theta, config_space):
     print("  Could not find suitable turn target after wider search.")
     return None # No suitable target found
 
-def plan_new_path(start_map_coords, end_map_coords, config_space_map):
-    """Plans and stores a new path, updating state."""
-    global current_path, path_index, navigation_state, furthest_path_index # Added furthest_path_index
+def plan_new_path(start_map_coords, end_map_coords, config_space_map, skeleton_map): # Added skeleton_map
+    """Plans and stores a new path constrained to the skeleton, updating state."""
+    global current_path, path_index, navigation_state, furthest_path_index
 
-    # Ensure integer coordinates for planner
-    start_map_coords = (int(start_map_coords[0]), int(start_map_coords[1]))
-    end_map_coords = (int(end_map_coords[0]), int(end_map_coords[1]))
+    print(f"Attempting to plan skeleton path from map {start_map_coords} towards {end_map_coords}")
 
-    # Check if start/end are the same
-    if start_map_coords == end_map_coords:
-        print("Planning skipped: Start and end points are the same.")
+    # --- Snap start and end points to the *nearest* skeleton point ---
+    snapped_start = find_closest_skeleton_point(skeleton_map, start_map_coords)
+    snapped_end = find_closest_skeleton_point(skeleton_map, end_map_coords)
+
+    if snapped_start is None:
+        print("Error: Could not find a skeleton point near the robot's start position. Cannot plan.")
+        navigation_state = NAV_STATE_IDLE # Stop if we can't even start on the skeleton
+        current_path = []
+        return
+    if snapped_end is None:
+        print("Error: Could not find a skeleton point near the target end position. Cannot plan.")
+        # Decide what to do: Stop? Try a different target? For now, stop exploring this path.
+        navigation_state = NAV_STATE_EXPLORING # Go back to exploring to find a new target
+        current_path = []
+        return
+
+    # Check if snapped start/end are the same
+    if snapped_start == snapped_end:
+        print("Planning skipped: Snapped start and end points on skeleton are the same.")
         current_path = []
         path_index = 0
-        furthest_path_index = 0 # Reset furthest index
+        furthest_path_index = 0
         navigation_state = NAV_STATE_EXPLORING # Go back to exploring state
         return
 
-    print(f"Setting state to PLANNING for path from {start_map_coords} to {end_map_coords}")
+    print(f"Snapped start: {snapped_start}, Snapped end: {snapped_end}")
+    print(f"Setting state to PLANNING for skeleton path...")
     navigation_state = NAV_STATE_PLANNING # Indicate planning is in progress
     robot.step(timestep) # Allow simulation step for UI update if needed
 
-    path_map_coords = path_planner(config_space_map, start_map_coords, end_map_coords)
+    # --- Call the modified path_planner ---
+    path_map_coords = path_planner(config_space_map, skeleton_map, snapped_start, snapped_end)
 
     if path_map_coords and len(path_map_coords) > 1:
-        # Convert map path to world path, skip the first point (current pos)
-        current_path = [map_to_world(p[0], p[1]) for p in path_map_coords[1:]]
-        path_index = 0 # Reset path index (might not be needed with new controller)
-        furthest_path_index = 0 # Reset furthest index for the new path
-        print(f"Successfully planned path with {len(current_path)} waypoints.")
-        # Transition back to EXPLORING, path following will start on next cycle
+        # Convert map path to world path.
+        # IMPORTANT: The path starts at snapped_start. The robot might not be exactly there.
+        # The path follower should handle the initial movement towards the first waypoint.
+        current_path = [map_to_world(p[0], p[1]) for p in path_map_coords] # Include the first point now
+        path_index = 0
+        furthest_path_index = 0
+        print(f"Successfully planned skeleton path with {len(current_path)} waypoints.")
         navigation_state = NAV_STATE_EXPLORING
     else:
-        print("Path planning failed. Clearing path.")
+        print("Skeleton path planning failed. Clearing path.")
         current_path = []
         path_index = 0
-        furthest_path_index = 0 # Reset furthest index
-        # Stay in PLANNING or switch to IDLE? Let's go back to EXPLORING to retry logic.
-        navigation_state = NAV_STATE_EXPLORING # Will likely try to plan again immediately
+        furthest_path_index = 0
+        navigation_state = NAV_STATE_EXPLORING # Go back to exploring to retry logic
 
-def handle_exploration(pose_x, pose_y, pose_theta, config_space_map):
-    """Handles the logic for autonomous exploration: follow path or plan new."""
-    global current_path, path_index, navigation_state, furthest_path_index # Added furthest_path_index
+
+def handle_exploration(pose_x, pose_y, pose_theta, config_space_map, skeleton_map): # Added skeleton_map
+    """Handles autonomous exploration, planning paths on the skeleton."""
+    global current_path, path_index, navigation_state, furthest_path_index
+
+    # Ensure skeleton map is available
+    if skeleton_map is None:
+        print("Error: Skeleton map not available for exploration. Stopping.")
+        navigation_state = NAV_STATE_IDLE
+        return 0, 0
 
     # --- Path Following ---
     if current_path:
-        # Use the new controller, passing and receiving furthest_path_index
+        # Use the path follower (no changes needed here, it follows world coords)
         vL, vR, path_finished, next_furthest_index = follow_path_controller(
             pose_x, pose_y, pose_theta, current_path, furthest_path_index
         )
-        furthest_path_index = next_furthest_index # Update global furthest index
+        furthest_path_index = next_furthest_index
 
         if path_finished:
             print("Path finished.")
-            current_path = [] # Clear the path
-            path_index = 0    # Reset index (though not strictly used by new controller)
-            furthest_path_index = 0 # Reset furthest index
-            return 0, 0 # Stop briefly before deciding next move
+            current_path = []
+            path_index = 0
+            furthest_path_index = 0
+            return 0, 0 # Stop briefly
         else:
-            return vL, vR # Continue following path
+            return vL, vR
 
     # --- Path Decision Making (No current path) ---
     else:
         robot_map_x, robot_map_y = world_to_map(pose_x, pose_y)
 
-        # Check if C-Space is valid at current location (should not happen ideally)
+        # Check if C-Space is valid at current location
         if config_space_map[robot_map_x, robot_map_y]:
              print("CRITICAL WARNING: Robot is inside C-Space obstacle! Stopping.")
              navigation_state = NAV_STATE_IDLE
-             current_path = [] # Ensure path is cleared
-             path_index = 0
-             furthest_path_index = 0 # Reset furthest index
+             current_path = []
+             furthest_path_index = 0
              return 0, 0
 
-        # Check directly ahead in config_space
+        # Check directly ahead in config_space for immediate obstacles
         is_front_blocked = check_front_obstacle(robot_map_x, robot_map_y, pose_theta, config_space_map, CHECK_FRONT_DISTANCE_M)
 
+        target_map_coords = None
         if not is_front_blocked:
-            # Plan to move straight
-            print("Attempting to plan straight path...")
+            # Try to find a target straight ahead
+            print("Attempting to find straight target...")
             target_map_coords = find_straight_target(robot_map_x, robot_map_y, pose_theta, config_space_map, STRAIGHT_TARGET_DISTANCE_M)
             if target_map_coords:
-                plan_new_path((robot_map_x, robot_map_y), target_map_coords, config_space_map)
-                return 0, 0 # Stop while planning
+                 print("Planning straight path (will snap to skeleton)...")
+                 plan_new_path((robot_map_x, robot_map_y), target_map_coords, config_space_map, skeleton_map) # Pass skeleton
+                 return 0, 0 # Stop while planning
             else:
-                # This case should ideally not happen with find_straight_target
-                print("Warning: Front clear but cannot find straight target? Attempting turn.")
-                target_map_coords = find_turn_target(robot_map_x, robot_map_y, pose_theta, config_space_map)
-                if target_map_coords:
-                    plan_new_path((robot_map_x, robot_map_y), target_map_coords, config_space_map)
-                    return 0, 0
-                else:
-                    print("Error: Cannot find straight or turn target. Stopping.")
-                    navigation_state = NAV_STATE_IDLE
-                    return 0, 0
-        else: # Front is blocked
-            print("Front blocked. Attempting to plan turn path...")
+                 print("Warning: Front clear but cannot find straight target? Attempting turn.")
+                 # Fall through to turn logic
+        # else: # Front is blocked (or straight target failed)
+        if target_map_coords is None: # If straight failed or front was blocked
+            print("Front blocked or straight failed. Attempting to find turn target...")
             target_map_coords = find_turn_target(robot_map_x, robot_map_y, pose_theta, config_space_map)
             if target_map_coords:
-                plan_new_path((robot_map_x, robot_map_y), target_map_coords, config_space_map)
-                return 0, 0
+                print("Planning turn path (will snap to skeleton)...")
+                plan_new_path((robot_map_x, robot_map_y), target_map_coords, config_space_map, skeleton_map) # Pass skeleton
+                return 0, 0 # Stop while planning
             else:
-                print("Error: Front blocked, cannot find turn target. Stopping.")
-                # Implement recovery? e.g., try turning 180? For now, stop.
+                print("Error: Cannot find suitable straight or turn target. Stopping exploration.")
                 navigation_state = NAV_STATE_IDLE
                 return 0, 0
 
@@ -1344,14 +1405,22 @@ while robot.step(timestep) != -1:
             arm_controller.get_current_joint_positions()
 
     elif navigation_state == NAV_STATE_EXPLORING:
-        # Autonomous logic determines velocities
-        temp_vL, temp_vR = handle_exploration(pose_x, pose_y, pose_theta, config_space)
+        # Ensure skeleton map exists before calling handle_exploration
+        current_skeleton_map = globals().get('free_space_skeleton_map') # Safely get map
+        if current_skeleton_map is not None:
+            # Autonomous logic determines velocities, using the skeleton map
+            temp_vL, temp_vR = handle_exploration(pose_x, pose_y, pose_theta, config_space, current_skeleton_map) # Pass skeleton map
+        else:
+            print("Warning: Exploration active but skeleton map not yet generated. Waiting.")
+            temp_vL, temp_vR = 0.0, 0.0 # Wait
+
         # Check for manual override
         if key in [ord('W'), ord('A'), ord('S'), ord('D')]:
              navigation_state = NAV_STATE_MANUAL_DRIVE
              print(f"Switched to '{navigation_state}' mode (Manual Override).")
-             # Let MANUAL_DRIVE handle the key press this cycle
              temp_vL, temp_vR = 0.0, 0.0 # Stop autonomous movement first
+             current_path = [] # Clear path on override
+             furthest_path_index = 0
 
     elif navigation_state == NAV_STATE_PLANNING:
         # Robot waits while planning is happening (triggered in plan_new_path)
