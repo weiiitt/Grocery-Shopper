@@ -36,6 +36,13 @@ TURN_TARGET_FORWARD_OFFSET_M = 1.0 # How far forward to aim for a turn target
 PATH_FOLLOW_LOOKAHEAD_DIST = 0.5 # Lookahead distance for path follower (meters) - Not used in current simple follower
 PATH_FOLLOW_GOAL_TOLERANCE = 0.30 # Tolerance to consider waypoint reached (meters)
 PATH_FOLLOW_KP_ANGULAR = 1.0 # Proportional gain for angular velocity in path follower
+PATH_FOLLOW_LOOKAHEAD_INDEX = 4 # How many waypoints ahead to look from the closest point
+PATH_FOLLOW_ALPHA_HIGH = 0.5 # Radians (~28 deg). Above this, pure rotation.
+PATH_FOLLOW_ALPHA_LOW = 0.1 # Radians (~5.7 deg). Below this, mostly forward.
+PATH_FOLLOW_STEERING_GAIN = 0.3 # Gain for steering correction
+PATH_FOLLOW_MAX_TURN_SPEED = MAX_SPEED / 4.0 # Max speed during pure rotation
+PATH_FOLLOW_FORWARD_SPEED_FACTOR = 0.5 # Base speed factor when moving forward (can be adjusted)
+
 
 
 robot_mode = "drive"
@@ -371,72 +378,138 @@ def path_planner(config_space_map, start_map, end_map):
     print(f"Path length: {len(path)} nodes.")
     return path
 
-def follow_path_controller(pose_x, pose_y, pose_theta, path_world_coords, current_path_index):
+def normalize_angle(angle):
+    """Normalize angle to [-pi, pi]"""
+    while angle > math.pi:
+        angle -= 2 * math.pi
+    while angle < -math.pi:
+        angle += 2 * math.pi
+    return angle
+
+def find_closest_point_index(path_world_coords, pose_x, pose_y):
+    """Finds the index of the closest waypoint in the path to the robot."""
+    if not path_world_coords:
+        return 0
+    min_dist_sq = float('inf')
+    closest_index = 0
+    for i, (wx, wy) in enumerate(path_world_coords):
+        dist_sq = (wx - pose_x)**2 + (wy - pose_y)**2
+        if dist_sq < min_dist_sq:
+            min_dist_sq = dist_sq
+            closest_index = i
+    return closest_index
+
+def turn_to_direction(pose_theta, target_theta, max_turn_speed):
+    """Calculates wheel speeds for pure rotation towards a target angle."""
+    angle_diff = normalize_angle(target_theta - pose_theta)
+
+    # Determine turn direction and base speed
+    # Positive angle_diff means turn left (vL negative, vR positive)
+    # Negative angle_diff means turn right (vL positive, vR negative)
+    turn_speed = max_turn_speed * np.sign(angle_diff)
+
+    # Scale speed based on how close to target angle (optional, simple version first)
+    # scale_factor = min(1.0, abs(angle_diff) / 0.1) # Example scaling
+    # turn_speed *= scale_factor
+
+    vL = -turn_speed
+    vR = turn_speed
+
+    # Optional: Add caster wheel drift correction if needed (like in lab5)
+    # correction = 0.2 * np.sign(angle_diff)
+    # vL += correction
+    # vR -= correction
+
+    return vL, vR
+
+
+def follow_path_controller(pose_x, pose_y, pose_theta, path_world_coords, current_furthest_index):
     """
-    Simple proportional heading controller to follow a path.
+    Path following controller inspired by lab5_controller2 logic.
+    Uses lookahead from the closest point on the path.
     Args:
         pose_x, pose_y, pose_theta: Current robot pose in world coordinates.
         path_world_coords (list): List of (x, y) world waypoints.
-        current_path_index (int): Index of the *next* target waypoint.
+        current_furthest_index (int): Index of the furthest waypoint reached so far.
     Returns:
-        tuple: (vL, vR, path_finished (bool), next_path_index (int))
+        tuple: (vL, vR, path_finished (bool), next_furthest_index (int))
     """
-    if not path_world_coords or current_path_index >= len(path_world_coords):
-        # print("Follower: Path finished or empty.")
-        return 0, 0, True, current_path_index # Path finished or invalid
+    if not path_world_coords:
+        return 0, 0, True, 0 # Path finished or empty
 
-    target_x, target_y = path_world_coords[current_path_index]
+    # Check distance to the *final* goal
+    final_target_x, final_target_y = path_world_coords[-1]
+    dist_to_final_target = math.sqrt((final_target_x - pose_x)**2 + (final_target_y - pose_y)**2)
 
-    # Check distance to current target waypoint
-    dist_to_target = math.sqrt((target_x - pose_x)**2 + (target_y - pose_y)**2)
+    if dist_to_final_target < PATH_FOLLOW_GOAL_TOLERANCE:
+        print("Follower: Reached final waypoint.")
+        return 0, 0, True, len(path_world_coords) - 1 # Reached final waypoint
 
-    # If close enough, advance to the next waypoint
-    if dist_to_target < PATH_FOLLOW_GOAL_TOLERANCE:
-        print(f"Reached waypoint {current_path_index}")
-        current_path_index += 1
-        if current_path_index >= len(path_world_coords):
-            print("Follower: Reached final waypoint.")
-            return 0, 0, True, current_path_index # Reached final waypoint
+    # Find the closest point on the path to the robot
+    closest_index = find_closest_point_index(path_world_coords, pose_x, pose_y)
 
-        # Update target to the new waypoint
-        target_x, target_y = path_world_coords[current_path_index]
-        # dist_to_target = math.sqrt((target_x - pose_x)**2 + (target_y - pose_y)**2) # Recalculate distance (optional)
+    # Update the furthest point reached index
+    next_furthest_index = max(current_furthest_index, closest_index)
 
-    # Calculate desired heading towards the target waypoint
-    desired_angle = math.atan2(target_y - pose_y, target_x - pose_x)
+    # Determine the lookahead target index
+    target_index = min(next_furthest_index + PATH_FOLLOW_LOOKAHEAD_INDEX, len(path_world_coords) - 1)
+
+    # Get the target coordinates
+    target_x, target_y = path_world_coords[target_index]
+
+    # Calculate distance and angle to the lookahead target
+    rho = math.sqrt((target_x - pose_x)**2 + (target_y - pose_y)**2)
+    desired_theta = math.atan2(target_y - pose_y, target_x - pose_x)
 
     # Calculate heading error
-    angle_error = desired_angle - pose_theta
-    # Normalize angle error to [-pi, pi]
-    while angle_error > math.pi: angle_error -= 2 * math.pi
-    while angle_error < -math.pi: angle_error += 2 * math.pi
+    angle_diff = normalize_angle(desired_theta - pose_theta)
+    alpha = abs(angle_diff)
 
-    # Proportional control for angular velocity
-    # Reduce forward speed significantly when turning sharply
-    turn_sharpness = abs(angle_error) / math.pi # 0 (straight) to 1 (180 deg turn)
-    # Scale down forward speed based on how sharp the turn is
-    # Allow some minimum speed even when turning
-    forward_speed_factor = max(0.1, 1.0 - turn_sharpness * 1.5)
+    vL_rads, vR_rads = 0.0, 0.0
 
-    # Calculate desired angular velocity (turn rate)
-    angular_velocity = PATH_FOLLOW_KP_ANGULAR * angle_error
+    # Controller logic based on angle error (alpha)
+    if alpha > PATH_FOLLOW_ALPHA_HIGH:
+        # Large error - pure rotation
+        vL_rads, vR_rads = turn_to_direction(pose_theta, desired_theta, PATH_FOLLOW_MAX_TURN_SPEED)
+        # print(f"Follower: Pure Turn (alpha={alpha:.2f})")
+    elif alpha > PATH_FOLLOW_ALPHA_LOW:
+        # Moderate error - blend turning and forward motion
+        blend_factor = 1.0 - (alpha - PATH_FOLLOW_ALPHA_LOW) / (PATH_FOLLOW_ALPHA_HIGH - PATH_FOLLOW_ALPHA_LOW)
 
-    # Convert linear and angular velocity to wheel speeds
-    linear_velocity_ms = MAX_SPEED_MS * forward_speed_factor
+        turn_vL, turn_vR = turn_to_direction(pose_theta, desired_theta, PATH_FOLLOW_MAX_TURN_SPEED)
 
-    vR_ms = linear_velocity_ms + angular_velocity * AXLE_LENGTH / 2.0
-    vL_ms = linear_velocity_ms - angular_velocity * AXLE_LENGTH / 2.0
+        # Reduced forward speed during turns
+        forward_speed_rads = MAX_SPEED * PATH_FOLLOW_FORWARD_SPEED_FACTOR * blend_factor
 
-    # Convert m/s to rad/s for the motors
-    vR_rads = vR_ms / WHEEL_RADIUS
-    vL_rads = vL_ms / WHEEL_RADIUS
+        # Combine turn and forward components
+        # Steering correction is implicitly handled by turn_to_direction blend
+        vL_rads = turn_vL * (1 - blend_factor) + forward_speed_rads * blend_factor
+        vR_rads = turn_vR * (1 - blend_factor) + forward_speed_rads * blend_factor
+        # print(f"Follower: Blended Turn (alpha={alpha:.2f}, blend={blend_factor:.2f})")
+    else:
+        # Small error - primarily forward motion with steering correction
+        if rho > 0.05: # Only move if not too close to the lookahead point
+            # Scale speed based on distance (optional, simple version first)
+            # base_speed = min(MAX_SPEED, MAX_SPEED * (rho / 1.0) * 2)
+            base_speed_rads = MAX_SPEED * PATH_FOLLOW_FORWARD_SPEED_FACTOR
+            steering = PATH_FOLLOW_STEERING_GAIN * angle_diff * MAX_SPEED # Steering proportional to angle error
+
+            vL_rads = base_speed_rads - steering
+            vR_rads = base_speed_rads + steering
+            # print(f"Follower: Forward (alpha={alpha:.2f}, rho={rho:.2f})")
+        else:
+            # Very close to lookahead point, slow down/stop turning
+            vL_rads, vR_rads = 0.0, 0.0
+            # print(f"Follower: Near Lookahead Target (rho={rho:.2f})")
+
 
     # Clamp wheel speeds to MAX_SPEED
-    vR_clamped = max(-MAX_SPEED, min(MAX_SPEED, vR_rads))
     vL_clamped = max(-MAX_SPEED, min(MAX_SPEED, vL_rads))
+    vR_clamped = max(-MAX_SPEED, min(MAX_SPEED, vR_rads))
 
-    # print(f"Follower: TargetIdx={current_path_index}, Target=({target_x:.2f},{target_y:.2f}), Dist={dist_to_target:.2f}, AngleErr={angle_error:.2f}, vL={vL_clamped:.2f}, vR={vR_clamped:.2f}")
-    return vL_clamped, vR_clamped, False, current_path_index
+    # print(f"Follower: TargetIdx={target_index}, Target=({target_x:.2f},{target_y:.2f}), Dist={rho:.2f}, AngleDiff={angle_diff:.2f}, vL={vL_clamped:.2f}, vR={vR_clamped:.2f}")
+    return vL_clamped, vR_clamped, False, next_furthest_index
+
 
 def check_front_obstacle(robot_map_x, robot_map_y, pose_theta, config_space, check_distance_m):
     """Checks for obstacles directly in front of the robot in config space."""
@@ -520,7 +593,7 @@ def find_turn_target(robot_map_x, robot_map_y, pose_theta, config_space):
 
 def plan_new_path(start_map_coords, end_map_coords, config_space_map):
     """Plans and stores a new path, updating state."""
-    global current_path, path_index, navigation_state
+    global current_path, path_index, navigation_state, furthest_path_index # Added furthest_path_index
 
     # Ensure integer coordinates for planner
     start_map_coords = (int(start_map_coords[0]), int(start_map_coords[1]))
@@ -531,6 +604,7 @@ def plan_new_path(start_map_coords, end_map_coords, config_space_map):
         print("Planning skipped: Start and end points are the same.")
         current_path = []
         path_index = 0
+        furthest_path_index = 0 # Reset furthest index
         navigation_state = NAV_STATE_EXPLORING # Go back to exploring state
         return
 
@@ -543,7 +617,8 @@ def plan_new_path(start_map_coords, end_map_coords, config_space_map):
     if path_map_coords and len(path_map_coords) > 1:
         # Convert map path to world path, skip the first point (current pos)
         current_path = [map_to_world(p[0], p[1]) for p in path_map_coords[1:]]
-        path_index = 0
+        path_index = 0 # Reset path index (might not be needed with new controller)
+        furthest_path_index = 0 # Reset furthest index for the new path
         print(f"Successfully planned path with {len(current_path)} waypoints.")
         # Transition back to EXPLORING, path following will start on next cycle
         navigation_state = NAV_STATE_EXPLORING
@@ -551,21 +626,27 @@ def plan_new_path(start_map_coords, end_map_coords, config_space_map):
         print("Path planning failed. Clearing path.")
         current_path = []
         path_index = 0
+        furthest_path_index = 0 # Reset furthest index
         # Stay in PLANNING or switch to IDLE? Let's go back to EXPLORING to retry logic.
         navigation_state = NAV_STATE_EXPLORING # Will likely try to plan again immediately
 
 def handle_exploration(pose_x, pose_y, pose_theta, config_space_map):
     """Handles the logic for autonomous exploration: follow path or plan new."""
-    global current_path, path_index, navigation_state
+    global current_path, path_index, navigation_state, furthest_path_index # Added furthest_path_index
 
     # --- Path Following ---
     if current_path:
-        vL, vR, path_finished, next_path_index = follow_path_controller(pose_x, pose_y, pose_theta, current_path, path_index)
-        path_index = next_path_index # Update global path index
+        # Use the new controller, passing and receiving furthest_path_index
+        vL, vR, path_finished, next_furthest_index = follow_path_controller(
+            pose_x, pose_y, pose_theta, current_path, furthest_path_index
+        )
+        furthest_path_index = next_furthest_index # Update global furthest index
+
         if path_finished:
             print("Path finished.")
             current_path = [] # Clear the path
-            path_index = 0
+            path_index = 0    # Reset index (though not strictly used by new controller)
+            furthest_path_index = 0 # Reset furthest index
             return 0, 0 # Stop briefly before deciding next move
         else:
             return vL, vR # Continue following path
@@ -579,6 +660,8 @@ def handle_exploration(pose_x, pose_y, pose_theta, config_space_map):
              print("CRITICAL WARNING: Robot is inside C-Space obstacle! Stopping.")
              navigation_state = NAV_STATE_IDLE
              current_path = [] # Ensure path is cleared
+             path_index = 0
+             furthest_path_index = 0 # Reset furthest index
              return 0, 0
 
         # Check directly ahead in config_space
@@ -987,6 +1070,7 @@ while robot.step(timestep) != -1:
             vL, vR = 0, 0 # Stop wheels
             current_path = [] # Clear path
             path_index = 0
+            furthest_path_index = 0 # Reset furthest index
         else:
             # Ensure C-Space is updated before starting exploration
             if steps_taken - last_config_space_update_step >= 0: # Check if C-space has been calculated at least once
@@ -999,6 +1083,7 @@ while robot.step(timestep) != -1:
             print(f"Switched to '{navigation_state}' mode.")
             current_path = [] # Clear any previous path
             path_index = 0
+            furthest_path_index = 0 # Reset furthest index
         key = -1 # Consume key
 
     # --- State Machine Logic ---
@@ -1128,13 +1213,26 @@ while robot.step(timestep) != -1:
             path_map_coords = [world_to_map(wp[0], wp[1]) for wp in current_path]
             robot_map_x_main, robot_map_y_main = world_to_map(pose_x, pose_y) # Use different var names
             if path_map_coords:
+                # Draw line from robot to the first *actual* waypoint being targeted (closest + lookahead)
+                # This requires finding the target index again, or passing it out
+                # For simplicity, just draw the full path for now.
+                # A better visualization would highlight the current lookahead target.
                 display.drawLine(robot_map_x_main, robot_map_y_main, path_map_coords[0][0], path_map_coords[0][1])
                 for i in range(len(path_map_coords) - 1):
                     display.drawLine(path_map_coords[i][0], path_map_coords[i][1], path_map_coords[i+1][0], path_map_coords[i+1][1])
-            if path_index < len(path_map_coords):
+
+            # Highlight the furthest point reached (optional visualization)
+            if furthest_path_index < len(path_map_coords):
+                display.setColor(0xFFFF00) # Yellow for furthest reached
+                f_map_x, f_map_y = path_map_coords[furthest_path_index]
+                display.fillOval(f_map_x, f_map_y, 2, 2)
+
+            # Highlight the lookahead target point (optional visualization)
+            # Use current_path instead of path_world_coords which is not defined here
+            lookahead_target_index = min(furthest_path_index + PATH_FOLLOW_LOOKAHEAD_INDEX, len(current_path) - 1)
+            if lookahead_target_index < len(path_map_coords):
                 display.setColor(0xFF00FF) # Magenta target waypoint
-                target_map_x, target_map_y = path_map_coords[path_index]
-                display.fillOval(target_map_x, target_map_y, 3, 3)
+                target_map_x, target_map_y = path_map_coords[lookahead_target_index]
 
         # Draw Robot Position (Red) on Main Display
         robot_map_x_main, robot_map_y_main = world_to_map(pose_x, pose_y)
